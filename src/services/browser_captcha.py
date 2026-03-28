@@ -270,6 +270,8 @@ class TokenBrowser:
     
     每次都是新的随机 UA，避免长时间运行导致的各种问题
     """
+    DEFAULT_MAX_SOLVES_PER_BROWSER = 10
+
     # UA pool updated on 2026-03-01 from browsers that scored >= 0.3.
     UA_LIST = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
@@ -389,6 +391,7 @@ class TokenBrowser:
         self._shared_proxy_url: Optional[str] = None
         self._shared_launch_count = 0
         self._shared_reuse_count = 0
+        self._shared_solve_count = 0
         self._consecutive_browser_failures = 0
         self._solve_inflight = 0
         self._last_idle_since = time.monotonic()
@@ -402,6 +405,13 @@ class TokenBrowser:
             "width": base_w,
             "height": base_h - random.randint(0, 80),
         }
+
+    def _get_max_solves_per_browser(self) -> int:
+        try:
+            value = getattr(config, "browser_max_solves_per_browser", self.DEFAULT_MAX_SOLVES_PER_BROWSER)
+            return max(1, int(value))
+        except Exception:
+            return self.DEFAULT_MAX_SOLVES_PER_BROWSER
 
     def _get_slot_marker(self) -> str:
         return f"--flow2api-browser-slot={self.token_id}"
@@ -689,6 +699,7 @@ class TokenBrowser:
         self._shared_proxy_url = None
         self._consecutive_browser_failures = 0
         self._shared_reuse_count = 0
+        self._shared_solve_count = 0
 
         if rotate_profile:
             self._refresh_browser_profile()
@@ -727,6 +738,10 @@ class TokenBrowser:
             if has_shared_browser and self._shared_proxy_url != expected_proxy_url:
                 # If the proxy configuration changed, recycle the slot before reusing it.
                 await self._recycle_browser_locked(reason="proxy_changed", rotate_profile=False)
+                has_shared_browser = False
+
+            if has_shared_browser and self._shared_solve_count >= self._get_max_solves_per_browser():
+                await self._recycle_browser_locked(reason="max_solves_reached", rotate_profile=True)
                 has_shared_browser = False
 
             if has_shared_browser:
@@ -1470,9 +1485,11 @@ class TokenBrowser:
                         token = await self._execute_captcha(context, project_id, website_key, action)
                         if token:
                             self._solve_count += 1
+                            self._shared_solve_count += 1
                             self._consecutive_browser_failures = 0
+                            max_solves = self._get_max_solves_per_browser()
                             debug_logger.log_info(
-                                f"[BrowserCaptcha] Token-{self.token_id} token acquired ({(time.time()-start_ts)*1000:.0f}ms, launches={self._shared_launch_count}, reuse={self._shared_reuse_count})"
+                                f"[BrowserCaptcha] Token-{self.token_id} token acquired ({(time.time()-start_ts)*1000:.0f}ms, launches={self._shared_launch_count}, reuse={self._shared_reuse_count}, shared_solves={self._shared_solve_count}/{max_solves})"
                             )
                             return token, None
 

@@ -81,6 +81,7 @@ async def lifespan(app: FastAPI):
     config.set_remote_browser_base_url(captcha_config.remote_browser_base_url)
     config.set_remote_browser_api_key(captcha_config.remote_browser_api_key)
     config.set_remote_browser_timeout(captcha_config.remote_browser_timeout)
+    config.set_browser_max_solves_per_browser(captcha_config.browser_max_solves_per_browser)
 
     # Initialize browser captcha service if needed
     browser_service = None

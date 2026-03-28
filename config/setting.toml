@@ -6,8 +6,8 @@ admin_password = "admin"
 [flow]
 labs_base_url = "https://labs.google/fx/api"
 api_base_url = "https://aisandbox-pa.googleapis.com/v1"
-timeout = 120
-max_retries = 4
+timeout = 180
+max_retries = 2
 image_request_timeout = 40
 image_timeout_retry_count = 1
 image_timeout_retry_delay = 0.8

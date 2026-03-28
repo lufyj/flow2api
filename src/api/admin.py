@@ -1453,6 +1453,7 @@ async def update_captcha_config(
     browser_proxy_enabled = request.get("browser_proxy_enabled", False)
     browser_proxy_url = request.get("browser_proxy_url", "")
     browser_count = request.get("browser_count", 1)
+    browser_max_solves_per_browser = request.get("browser_max_solves_per_browser", 10)
 
     # 验证浏览器代理URL格式
     if browser_proxy_enabled and browser_proxy_url:
@@ -1470,6 +1471,11 @@ async def update_captcha_config(
         remote_browser_timeout = max(5, int(remote_browser_timeout or 60))
     except Exception:
         return {"success": False, "message": "远程打码超时时间必须是整数秒"}
+
+    try:
+        browser_max_solves_per_browser = max(1, int(browser_max_solves_per_browser or 10))
+    except Exception:
+        return {"success": False, "message": "单个浏览器最多打码次数必须是正整数"}
 
     if captcha_method == "remote_browser":
         if not (remote_browser_base_url or "").strip():
@@ -1492,7 +1498,8 @@ async def update_captcha_config(
         remote_browser_timeout=remote_browser_timeout,
         browser_proxy_enabled=browser_proxy_enabled,
         browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
-        browser_count=max(1, int(browser_count)) if browser_count else 1
+        browser_count=max(1, int(browser_count)) if browser_count else 1,
+        browser_max_solves_per_browser=browser_max_solves_per_browser
     )
 
     # 如果使用 browser 打码，热重载浏览器数量配置
@@ -1529,7 +1536,8 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "remote_browser_timeout": captcha_config.remote_browser_timeout,
         "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
         "browser_proxy_url": captcha_config.browser_proxy_url or "",
-        "browser_count": captcha_config.browser_count
+        "browser_count": captcha_config.browser_count,
+        "browser_max_solves_per_browser": captcha_config.browser_max_solves_per_browser
     }
 
 

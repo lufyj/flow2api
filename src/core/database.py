@@ -190,6 +190,7 @@ class Database:
             remote_browser_base_url = ""
             remote_browser_api_key = ""
             remote_browser_timeout = 60
+            browser_max_solves_per_browser = 10
 
             if config_dict:
                 captcha_config = config_dict.get("captcha", {})
@@ -199,17 +200,23 @@ class Database:
                 remote_browser_base_url = captcha_config.get("remote_browser_base_url", "")
                 remote_browser_api_key = captcha_config.get("remote_browser_api_key", "")
                 remote_browser_timeout = captcha_config.get("remote_browser_timeout", 60)
+                browser_max_solves_per_browser = captcha_config.get("browser_max_solves_per_browser", 10)
             try:
                 remote_browser_timeout = max(5, int(remote_browser_timeout))
             except Exception:
                 remote_browser_timeout = 60
+            try:
+                browser_max_solves_per_browser = max(1, int(browser_max_solves_per_browser))
+            except Exception:
+                browser_max_solves_per_browser = 10
 
             await db.execute("""
                 INSERT INTO captcha_config (
                     id, captcha_method, yescaptcha_api_key, yescaptcha_base_url,
-                    remote_browser_base_url, remote_browser_api_key, remote_browser_timeout
+                    remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
+                    browser_max_solves_per_browser
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 captcha_method,
                 yescaptcha_api_key,
@@ -217,6 +224,7 @@ class Database:
                 remote_browser_base_url,
                 remote_browser_api_key,
                 remote_browser_timeout,
+                browser_max_solves_per_browser,
             ))
 
         # Ensure plugin_config has a row
@@ -307,6 +315,7 @@ class Database:
                         page_action TEXT DEFAULT 'IMAGE_GENERATION',
                         browser_proxy_enabled BOOLEAN DEFAULT 0,
                         browser_proxy_url TEXT,
+                        browser_max_solves_per_browser INTEGER DEFAULT 10,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
@@ -388,6 +397,7 @@ class Database:
                     ("capsolver_api_key", "TEXT DEFAULT ''"),
                     ("capsolver_base_url", "TEXT DEFAULT 'https://api.capsolver.com'"),
                     ("browser_count", "INTEGER DEFAULT 1"),
+                    ("browser_max_solves_per_browser", "INTEGER DEFAULT 10"),
                     ("remote_browser_base_url", "TEXT DEFAULT ''"),
                     ("remote_browser_api_key", "TEXT DEFAULT ''"),
                     ("remote_browser_timeout", "INTEGER DEFAULT 60"),
@@ -634,6 +644,7 @@ class Database:
                     browser_proxy_enabled BOOLEAN DEFAULT 0,
                     browser_proxy_url TEXT,
                     browser_count INTEGER DEFAULT 1,
+                    browser_max_solves_per_browser INTEGER DEFAULT 10,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -1478,6 +1489,7 @@ class Database:
             config.set_remote_browser_base_url(captcha_config.remote_browser_base_url)
             config.set_remote_browser_api_key(captcha_config.remote_browser_api_key)
             config.set_remote_browser_timeout(captcha_config.remote_browser_timeout)
+            config.set_browser_max_solves_per_browser(captcha_config.browser_max_solves_per_browser)
 
     # Cache config operations
     async def get_cache_config(self) -> CacheConfig:
@@ -1609,7 +1621,8 @@ class Database:
         remote_browser_timeout: int = None,
         browser_proxy_enabled: bool = None,
         browser_proxy_url: str = None,
-        browser_count: int = None
+        browser_count: int = None,
+        browser_max_solves_per_browser: int = None
     ):
         """Update captcha configuration"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -1634,7 +1647,9 @@ class Database:
                 new_proxy_enabled = browser_proxy_enabled if browser_proxy_enabled is not None else current.get("browser_proxy_enabled", False)
                 new_proxy_url = browser_proxy_url if browser_proxy_url is not None else current.get("browser_proxy_url")
                 new_browser_count = browser_count if browser_count is not None else current.get("browser_count", 1)
+                new_browser_max_solves = browser_max_solves_per_browser if browser_max_solves_per_browser is not None else current.get("browser_max_solves_per_browser", 10)
                 new_remote_timeout = max(5, int(new_remote_timeout)) if new_remote_timeout is not None else 60
+                new_browser_max_solves = max(1, int(new_browser_max_solves))
 
                 await db.execute("""
                     UPDATE captcha_config
@@ -1643,12 +1658,13 @@ class Database:
                         ezcaptcha_api_key = ?, ezcaptcha_base_url = ?,
                         capsolver_api_key = ?, capsolver_base_url = ?,
                         remote_browser_base_url = ?, remote_browser_api_key = ?, remote_browser_timeout = ?,
-                        browser_proxy_enabled = ?, browser_proxy_url = ?, browser_count = ?, updated_at = CURRENT_TIMESTAMP
+                        browser_proxy_enabled = ?, browser_proxy_url = ?, browser_count = ?,
+                        browser_max_solves_per_browser = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = 1
                 """, (new_method, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
-                      new_proxy_enabled, new_proxy_url, new_browser_count))
+                      new_proxy_enabled, new_proxy_url, new_browser_count, new_browser_max_solves))
             else:
                 new_method = captcha_method if captcha_method is not None else "yescaptcha"
                 new_yes_key = yescaptcha_api_key if yescaptcha_api_key is not None else ""
@@ -1665,19 +1681,21 @@ class Database:
                 new_proxy_enabled = browser_proxy_enabled if browser_proxy_enabled is not None else False
                 new_proxy_url = browser_proxy_url
                 new_browser_count = browser_count if browser_count is not None else 1
+                new_browser_max_solves = browser_max_solves_per_browser if browser_max_solves_per_browser is not None else 10
                 new_remote_timeout = max(5, int(new_remote_timeout))
+                new_browser_max_solves = max(1, int(new_browser_max_solves))
 
                 await db.execute("""
                     INSERT INTO captcha_config (id, captcha_method, yescaptcha_api_key, yescaptcha_base_url,
                         capmonster_api_key, capmonster_base_url, ezcaptcha_api_key, ezcaptcha_base_url,
                         capsolver_api_key, capsolver_base_url,
                         remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
-                        browser_proxy_enabled, browser_proxy_url, browser_count)
-                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        browser_proxy_enabled, browser_proxy_url, browser_count, browser_max_solves_per_browser)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (new_method, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
-                      new_proxy_enabled, new_proxy_url, new_browser_count))
+                      new_proxy_enabled, new_proxy_url, new_browser_count, new_browser_max_solves))
 
             await db.commit()
 

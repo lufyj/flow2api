@@ -390,6 +390,23 @@ class Config:
             return 600
 
     @property
+    def browser_max_solves_per_browser(self) -> int:
+        value = self._config.get("captcha", {}).get("browser_max_solves_per_browser", 10)
+        try:
+            return max(1, int(value))
+        except Exception:
+            return 10
+
+    def set_browser_max_solves_per_browser(self, value: int):
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        try:
+            normalized = max(1, int(value))
+        except Exception:
+            normalized = 10
+        self._config["captcha"]["browser_max_solves_per_browser"] = normalized
+
+    @property
     def yescaptcha_api_key(self) -> str:
         """Get YesCaptcha API key"""
         return self._config.get("captcha", {}).get("yescaptcha_api_key", "")
