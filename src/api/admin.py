@@ -1,6 +1,7 @@
 """Admin API routes"""
 import asyncio
 import json
+import traceback
 import urllib.error
 import urllib.request
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
@@ -15,6 +16,7 @@ from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager
 from ..core.database import Database
 from ..core.config import config
+from ..core.logger import debug_logger
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
@@ -38,6 +40,23 @@ def _mask_token(token: Optional[str]) -> str:
     if len(token) <= 24:
         return token
     return f"{token[:18]}...{token[-8:]}"
+
+
+def _format_plugin_token_error(error: Exception, action: str) -> str:
+    """Format clearer plugin token sync errors for common upstream failures."""
+    error_text = str(error)
+
+    if "Flow API request failed: HTTP Error 401" in error_text:
+        if action == "add":
+            return (
+                "插件同步失败：该 Session Token 虽然可以换取 Access Token，但在创建默认项目时被上游接口拒绝 "
+                "(HTTP 401)。这通常表示当前 ST 已失效、不完整，或不具备创建项目所需权限。"
+            )
+        return (
+            "插件同步失败：上游接口拒绝了当前 Session Token (HTTP 401)，请检查插件抓取到的 ST 是否完整且仍然有效。"
+        )
+
+    return f"插件同步失败：{error_text}"
 
 
 def _truncate_text(text: Any, limit: int = 240) -> str:
@@ -1908,8 +1927,17 @@ async def update_plugin_config(
 @router.post("/api/plugin/update-token")
 async def plugin_update_token(request: dict, authorization: Optional[str] = Header(None)):
     """Receive token update from Chrome extension (no admin auth required, uses connection_token)"""
+    debug_logger.log_info(
+        f"[PLUGIN_UPDATE] 请求进入: has_auth={bool(authorization)}, "
+        f"has_session_token={bool(request.get('session_token'))}"
+    )
+
     # Verify connection token
     plugin_config = await db.get_plugin_config()
+    debug_logger.log_info(
+        f"[PLUGIN_UPDATE] 已加载插件配置: has_connection_token={bool(plugin_config.connection_token)}, "
+        f"auto_enable_on_update={plugin_config.auto_enable_on_update}"
+    )
 
     # Extract token from Authorization header
     provided_token = None
@@ -1921,23 +1949,35 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
 
     # Check if token matches
     if not plugin_config.connection_token or provided_token != plugin_config.connection_token:
+        debug_logger.log_warning(
+            f"[PLUGIN_UPDATE] 连接令牌校验失败: "
+            f"configured={bool(plugin_config.connection_token)}, provided={bool(provided_token)}"
+        )
         raise HTTPException(status_code=401, detail="Invalid connection token")
 
     # Extract session token from request
     session_token = request.get("session_token")
 
     if not session_token:
+        debug_logger.log_warning("[PLUGIN_UPDATE] 缺少 session_token")
         raise HTTPException(status_code=400, detail="Missing session_token")
 
     # Step 1: Convert ST to AT to get user info (including email)
     try:
+        debug_logger.log_info(
+            f"[PLUGIN_UPDATE] 开始 ST→AT 转换: session_token={_mask_token(session_token)}"
+        )
         result = await token_manager.flow_client.st_to_at(session_token)
         at = result["access_token"]
         expires = result.get("expires")
         user_info = result.get("user", {})
         email = user_info.get("email", "")
+        debug_logger.log_info(
+            f"[PLUGIN_UPDATE] ST→AT 成功: email={email or '<empty>'}, expires={expires}"
+        )
 
         if not email:
+            debug_logger.log_warning("[PLUGIN_UPDATE] ST→AT 成功但未获取到 email")
             raise HTTPException(status_code=400, detail="Failed to get email from session token")
 
         # Parse expiration time
@@ -1950,14 +1990,25 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 pass
 
     except Exception as e:
+        debug_logger.log_error(
+            f"[PLUGIN_UPDATE] ST→AT 失败: error={str(e)}\n{traceback.format_exc()}"
+        )
         raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
 
     # Step 2: Check if token with this email exists
     existing_token = await db.get_token_by_email(email)
+    debug_logger.log_info(
+        f"[PLUGIN_UPDATE] 邮箱匹配结果: email={email}, existing_token_id="
+        f"{existing_token.id if existing_token else 'None'}"
+    )
 
     if existing_token:
         # Update existing token
         try:
+            debug_logger.log_info(
+                f"[PLUGIN_UPDATE] 开始更新已有 Token: token_id={existing_token.id}, "
+                f"is_active={existing_token.is_active}"
+            )
             # Update token
             await token_manager.update_token(
                 token_id=existing_token.id,
@@ -1968,6 +2019,9 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
 
             # Check if auto-enable is enabled and token is disabled
             if plugin_config.auto_enable_on_update and not existing_token.is_active:
+                debug_logger.log_info(
+                    f"[PLUGIN_UPDATE] 命中自动启用: token_id={existing_token.id}"
+                )
                 await token_manager.enable_token(existing_token.id)
                 return {
                     "success": True,
@@ -1982,13 +2036,24 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 "action": "updated"
             }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to update token: {str(e)}")
+            debug_logger.log_error(
+                f"[PLUGIN_UPDATE] 更新已有 Token 失败: token_id={existing_token.id}, "
+                f"email={email}, error={str(e)}\n{traceback.format_exc()}"
+            )
+            raise HTTPException(status_code=500, detail=_format_plugin_token_error(e, "update"))
     else:
         # Add new token
         try:
+            debug_logger.log_info(
+                f"[PLUGIN_UPDATE] 开始新增 Token: email={email}, "
+                f"session_token={_mask_token(session_token)}"
+            )
             new_token = await token_manager.add_token(
                 st=session_token,
                 remark="Added by Chrome Extension"
+            )
+            debug_logger.log_info(
+                f"[PLUGIN_UPDATE] 新增 Token 成功: token_id={new_token.id}, email={new_token.email}"
             )
 
             return {
@@ -1998,4 +2063,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 "token_id": new_token.id
             }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to add token: {str(e)}")
+            debug_logger.log_error(
+                f"[PLUGIN_UPDATE] 新增 Token 失败: email={email}, error={str(e)}\n"
+                f"{traceback.format_exc()}"
+            )
+            raise HTTPException(status_code=500, detail=_format_plugin_token_error(e, "add"))
