@@ -1674,13 +1674,47 @@ class BrowserCaptchaService:
                 }
             """, label="extract_tab_fingerprint", timeout_seconds=8.0)
             if not isinstance(fingerprint, dict):
-                return None
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] extract_tab_fingerprint 返回非 dict: type={type(fingerprint).__name__}, value={str(fingerprint)[:300]}"
+                )
+                try:
+                    fallback_ua = await self._tab_evaluate(
+                        tab,
+                        "navigator.userAgent || ''",
+                        label="extract_fingerprint_fallback_ua",
+                        timeout_seconds=3.0,
+                    )
+                    fallback_lang = await self._tab_evaluate(
+                        tab,
+                        "navigator.language || ''",
+                        label="extract_fingerprint_fallback_lang",
+                        timeout_seconds=3.0,
+                    )
+                    fingerprint = {
+                        "user_agent": fallback_ua or "",
+                        "accept_language": fallback_lang or "",
+                    }
+                except Exception as fallback_error:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] extract_tab_fingerprint fallback 失败: {fallback_error}"
+                    )
+                    return None
 
             result: Dict[str, Any] = {"proxy_url": self._proxy_url}
             for key in ("user_agent", "accept_language", "sec_ch_ua", "sec_ch_ua_mobile", "sec_ch_ua_platform"):
                 value = fingerprint.get(key)
                 if isinstance(value, str) and value:
                     result[key] = value
+            if len(result) <= 1:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] extract_tab_fingerprint 结果为空: raw={str(fingerprint)[:300]}"
+                )
+                return None
+            debug_logger.log_info(
+                f"[BrowserCaptcha] extract_tab_fingerprint 成功: ua={result.get('user_agent', '')[:120]}, "
+                f"lang={result.get('accept_language', '')}, sec_ch_ua={'yes' if result.get('sec_ch_ua') else 'no'}, "
+                f"sec_ch_mobile={result.get('sec_ch_ua_mobile', '')}, sec_ch_platform={result.get('sec_ch_ua_platform', '')}"
+            )
             return result
         except Exception as e:
             debug_logger.log_warning(f"[BrowserCaptcha] 提取 nodriver 指纹失败: {e}")

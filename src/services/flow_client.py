@@ -132,6 +132,33 @@ class FlowClient:
         """设置当前请求链路的浏览器指纹上下文。"""
         self._request_fingerprint_ctx.set(dict(fingerprint) if fingerprint else None)
 
+    def _summarize_fingerprint(self, fingerprint: Optional[Dict[str, Any]]) -> str:
+        """Build a concise fingerprint summary for debug logs."""
+        if not isinstance(fingerprint, dict) or not fingerprint:
+            return "none"
+
+        summary = {
+            "user_agent": fingerprint.get("user_agent", ""),
+            "accept_language": fingerprint.get("accept_language", ""),
+            "sec_ch_ua": fingerprint.get("sec_ch_ua", ""),
+            "sec_ch_ua_mobile": fingerprint.get("sec_ch_ua_mobile", ""),
+            "sec_ch_ua_platform": fingerprint.get("sec_ch_ua_platform", ""),
+            "proxy_url": fingerprint.get("proxy_url", None),
+        }
+        return json.dumps(summary, ensure_ascii=False)
+
+    def _resolve_impersonate(self, headers: Dict[str, Any], fingerprint: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Choose curl_cffi impersonation only when it matches the outgoing headers."""
+        user_agent = str(headers.get("User-Agent", "") or "")
+        ua_lower = user_agent.lower()
+        if "firefox/" in ua_lower:
+            return None
+        if "chrome/" in ua_lower or "edg/" in ua_lower:
+            return "chrome110"
+        if isinstance(fingerprint, dict) and fingerprint:
+            return None
+        return "chrome110"
+
     def get_request_fingerprint(self) -> Optional[Dict[str, Any]]:
         """获取当前请求链路绑定的浏览器指纹快照。"""
         fingerprint = self._request_fingerprint_ctx.get()
@@ -230,12 +257,16 @@ class FlowClient:
             if fingerprint.get("sec_ch_ua_platform"):
                 headers["sec-ch-ua-platform"] = fingerprint["sec_ch_ua_platform"]
 
-        # Add default Chromium/Android client headers (do not override explicitly provided values).
-        for key, value in self._default_client_headers.items():
-            headers.setdefault(key, value)
+        # Only add synthetic Chromium/Android headers when no real browser fingerprint is bound.
+        if not (isinstance(fingerprint, dict) and fingerprint):
+            for key, value in self._default_client_headers.items():
+                headers.setdefault(key, value)
 
         # Log request
         if config.debug_enabled:
+            debug_logger.log_info(
+                f"[FINGERPRINT] request_context={self._summarize_fingerprint(fingerprint)}"
+            )
             if isinstance(fingerprint, dict):
                 proxy_for_log = proxy_url if proxy_url else "direct"
                 debug_logger.log_info(
@@ -252,24 +283,27 @@ class FlowClient:
         start_time = time.time()
 
         try:
+            impersonate = self._resolve_impersonate(headers, fingerprint)
             async with AsyncSession() as session:
                 if method.upper() == "GET":
-                    response = await session.get(
-                        url,
-                        headers=headers,
-                        proxy=proxy_url,
-                        timeout=request_timeout,
-                        impersonate="chrome110"
-                    )
+                    request_kwargs = {
+                        "headers": headers,
+                        "proxy": proxy_url,
+                        "timeout": request_timeout,
+                    }
+                    if impersonate:
+                        request_kwargs["impersonate"] = impersonate
+                    response = await session.get(url, **request_kwargs)
                 else:  # POST
-                    response = await session.post(
-                        url,
-                        headers=headers,
-                        json=json_data,
-                        proxy=proxy_url,
-                        timeout=request_timeout,
-                        impersonate="chrome110"
-                    )
+                    request_kwargs = {
+                        "headers": headers,
+                        "json": json_data,
+                        "proxy": proxy_url,
+                        "timeout": request_timeout,
+                    }
+                    if impersonate:
+                        request_kwargs["impersonate"] = impersonate
+                    response = await session.post(url, **request_kwargs)
 
                 duration_ms = (time.time() - start_time) * 1000
 
@@ -2283,6 +2317,9 @@ class FlowClient:
                 debug_logger.log_info(f"[reCAPTCHA] get_token 返回: {token[:50] if token else None}...")
                 fingerprint = service.get_last_fingerprint() if token else None
                 self._set_request_fingerprint(fingerprint if token else None)
+                debug_logger.log_info(
+                    f"[FINGERPRINT] captcha_method=personal, acquired={self._summarize_fingerprint(fingerprint if token else None)}"
+                )
                 return token, None
             except RuntimeError as e:
                 # 捕获 Docker 环境或依赖缺失的明确错误
@@ -2308,6 +2345,9 @@ class FlowClient:
                 token, browser_id = await service.get_token(project_id, action, token_id=token_id)
                 fingerprint = await service.get_fingerprint(browser_id) if token else None
                 self._set_request_fingerprint(fingerprint if token else None)
+                debug_logger.log_info(
+                    f"[FINGERPRINT] captcha_method=browser, acquired={self._summarize_fingerprint(fingerprint if token else None)}"
+                )
                 return token, browser_id
             except RuntimeError as e:
                 # 捕获 Docker 环境或依赖缺失的明确错误
@@ -2342,6 +2382,9 @@ class FlowClient:
                 session_id = payload.get("session_id")
                 fingerprint = payload.get("fingerprint") if isinstance(payload.get("fingerprint"), dict) else None
                 self._set_request_fingerprint(fingerprint if token else None)
+                debug_logger.log_info(
+                    f"[FINGERPRINT] captcha_method=remote_browser, acquired={self._summarize_fingerprint(fingerprint if token else None)}"
+                )
                 if not token or not session_id:
                     raise RuntimeError(f"remote_browser 返回缺少 token/session_id: {payload}")
                 return token, str(session_id)
