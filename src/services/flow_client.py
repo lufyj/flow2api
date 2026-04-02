@@ -143,6 +143,12 @@ class FlowClient:
             "sec_ch_ua": fingerprint.get("sec_ch_ua", ""),
             "sec_ch_ua_mobile": fingerprint.get("sec_ch_ua_mobile", ""),
             "sec_ch_ua_platform": fingerprint.get("sec_ch_ua_platform", ""),
+            "sec_ch_ua_full_version_list": fingerprint.get("sec_ch_ua_full_version_list", ""),
+            "sec_ch_ua_arch": fingerprint.get("sec_ch_ua_arch", ""),
+            "sec_ch_ua_bitness": fingerprint.get("sec_ch_ua_bitness", ""),
+            "sec_ch_ua_model": fingerprint.get("sec_ch_ua_model", ""),
+            "sec_ch_ua_platform_version": fingerprint.get("sec_ch_ua_platform_version", ""),
+            "sec_ch_ua_wow64": fingerprint.get("sec_ch_ua_wow64", ""),
             "proxy_url": fingerprint.get("proxy_url", None),
         }
         return json.dumps(summary, ensure_ascii=False)
@@ -250,12 +256,21 @@ class FlowClient:
         if isinstance(fingerprint, dict):
             if fingerprint.get("accept_language"):
                 headers.setdefault("Accept-Language", fingerprint["accept_language"])
-            if fingerprint.get("sec_ch_ua"):
-                headers["sec-ch-ua"] = fingerprint["sec_ch_ua"]
-            if fingerprint.get("sec_ch_ua_mobile"):
-                headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
-            if fingerprint.get("sec_ch_ua_platform"):
-                headers["sec-ch-ua-platform"] = fingerprint["sec_ch_ua_platform"]
+            fingerprint_header_map = {
+                "sec_ch_ua": "sec-ch-ua",
+                "sec_ch_ua_mobile": "sec-ch-ua-mobile",
+                "sec_ch_ua_platform": "sec-ch-ua-platform",
+                "sec_ch_ua_full_version_list": "sec-ch-ua-full-version-list",
+                "sec_ch_ua_arch": "sec-ch-ua-arch",
+                "sec_ch_ua_bitness": "sec-ch-ua-bitness",
+                "sec_ch_ua_model": "sec-ch-ua-model",
+                "sec_ch_ua_platform_version": "sec-ch-ua-platform-version",
+                "sec_ch_ua_wow64": "sec-ch-ua-wow64",
+            }
+            for fingerprint_key, header_name in fingerprint_header_map.items():
+                header_value = fingerprint.get(fingerprint_key)
+                if isinstance(header_value, str) and header_value:
+                    headers[header_name] = header_value
 
         # Only add synthetic Chromium/Android headers when no real browser fingerprint is bound.
         if not (isinstance(fingerprint, dict) and fingerprint):

@@ -10,9 +10,11 @@ import os
 import sys
 import re
 import json
+import random
 import shutil
 import tempfile
 import subprocess
+import traceback
 from typing import Optional, Dict, Any, Iterable
 
 from ..core.logger import debug_logger
@@ -234,6 +236,502 @@ class BrowserCaptchaService:
 
     _instance: Optional['BrowserCaptchaService'] = None
     _lock = asyncio.Lock()
+    _PROFILE_LANG_CANDIDATES = [
+        "en-US",
+        "en-US,en",
+        "en-GB,en",
+        "en-CA,en",
+    ]
+    _PROFILE_TEMPLATE_CANDIDATES = [
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "125"},
+                {"brand": "Google Chrome", "version": "125"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "125.0.0.0"},
+                {"brand": "Google Chrome", "version": "125.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "126"},
+                {"brand": "Google Chrome", "version": "126"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "126.0.0.0"},
+                {"brand": "Google Chrome", "version": "126.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "127"},
+                {"brand": "Google Chrome", "version": "127"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "127.0.0.0"},
+                {"brand": "Google Chrome", "version": "127.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "128"},
+                {"brand": "Google Chrome", "version": "128"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "128.0.0.0"},
+                {"brand": "Google Chrome", "version": "128.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "129"},
+                {"brand": "Google Chrome", "version": "129"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "129.0.0.0"},
+                {"brand": "Google Chrome", "version": "129.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "130"},
+                {"brand": "Google Chrome", "version": "130"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "130.0.0.0"},
+                {"brand": "Google Chrome", "version": "130.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "131"},
+                {"brand": "Google Chrome", "version": "131"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "131.0.0.0"},
+                {"brand": "Google Chrome", "version": "131.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "132"},
+                {"brand": "Google Chrome", "version": "132"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "132.0.0.0"},
+                {"brand": "Google Chrome", "version": "132.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "133"},
+                {"brand": "Google Chrome", "version": "133"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "133.0.0.0"},
+                {"brand": "Google Chrome", "version": "133.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "134"},
+                {"brand": "Google Chrome", "version": "134"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "134.0.0.0"},
+                {"brand": "Google Chrome", "version": "134.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "135"},
+                {"brand": "Google Chrome", "version": "135"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "135.0.0.0"},
+                {"brand": "Google Chrome", "version": "135.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "136"},
+                {"brand": "Google Chrome", "version": "136"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "136.0.0.0"},
+                {"brand": "Google Chrome", "version": "136.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "137"},
+                {"brand": "Google Chrome", "version": "137"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "137.0.0.0"},
+                {"brand": "Google Chrome", "version": "137.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "138"},
+                {"brand": "Google Chrome", "version": "138"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "138.0.0.0"},
+                {"brand": "Google Chrome", "version": "138.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "139"},
+                {"brand": "Google Chrome", "version": "139"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "139.0.0.0"},
+                {"brand": "Google Chrome", "version": "139.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "140"},
+                {"brand": "Google Chrome", "version": "140"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "140.0.0.0"},
+                {"brand": "Google Chrome", "version": "140.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "141"},
+                {"brand": "Google Chrome", "version": "141"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "141.0.0.0"},
+                {"brand": "Google Chrome", "version": "141.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "142"},
+                {"brand": "Google Chrome", "version": "142"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "142.0.0.0"},
+                {"brand": "Google Chrome", "version": "142.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "143"},
+                {"brand": "Google Chrome", "version": "143"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "143.0.0.0"},
+                {"brand": "Google Chrome", "version": "143.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "144"},
+                {"brand": "Google Chrome", "version": "144"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "144.0.0.0"},
+                {"brand": "Google Chrome", "version": "144.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "145"},
+                {"brand": "Google Chrome", "version": "145"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "145.0.0.0"},
+                {"brand": "Google Chrome", "version": "145.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "146"},
+                {"brand": "Google Chrome", "version": "146"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "146.0.0.0"},
+                {"brand": "Google Chrome", "version": "146.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "147"},
+                {"brand": "Google Chrome", "version": "147"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "147.0.0.0"},
+                {"brand": "Google Chrome", "version": "147.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+        {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "8"},
+                {"brand": "Chromium", "version": "148"},
+                {"brand": "Google Chrome", "version": "148"},
+            ],
+            "full_version_list": [
+                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                {"brand": "Chromium", "version": "148.0.0.0"},
+                {"brand": "Google Chrome", "version": "148.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platform_version": "10.0.0",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+    ]
+    _PROFILE_VIEWPORT_CANDIDATES = [
+        (1280, 720),
+        (1366, 768),
+        (1440, 900),
+        (1536, 864),
+        (1600, 900),
+        (1728, 972),
+    ]
 
     def __init__(self, db=None):
         """初始化服务"""
@@ -244,19 +742,25 @@ class BrowserCaptchaService:
         self.db = db
         # 使用 None 让 nodriver 自动创建临时目录，避免目录锁定问题
         self.user_data_dir = None
+        self._fingerprint_profile = self._build_fingerprint_profile()
+        self._tab_fingerprint_profiles: dict[int, Dict[str, Any]] = {}
 
         # 常驻模式相关属性：打码标签页是全局共享池，不再按 project_id 一对一绑定
         self._resident_tabs: dict[str, 'ResidentTabInfo'] = {}  # slot_id -> 常驻标签页信息
         self._project_resident_affinity: dict[str, str] = {}  # project_id -> slot_id（最近一次使用）
         self._resident_slot_seq = 0
-        self._resident_pick_index = 0
+        self._resident_last_selected_order_key: Optional[tuple[float, str]] = None
         self._resident_lock = asyncio.Lock()  # 保护常驻标签页操作
         self._browser_lock = asyncio.Lock()  # 保护浏览器初始化/关闭/重启，避免重复拉起实例
         self._tab_build_lock = asyncio.Lock()  # 串行化冷启动/重建，降低 nodriver 抖动
         self._legacy_lock = asyncio.Lock()  # 避免 legacy fallback 并发失控创建临时标签页
-        self._max_resident_tabs = 5  # 最大常驻标签页数量（支持并发）
-        self._idle_tab_ttl_seconds = 600  # 标签页空闲超时(秒)
+        self._max_resident_tabs = int(max(1, getattr(config, "personal_max_resident_tabs", 5) or 5))  # 最大常驻标签页数量（支持并发）
+        self._idle_tab_ttl_seconds = int(max(60, getattr(config, "personal_idle_tab_ttl_seconds", 600) or 600))  # 标签页空闲超时(秒)
         self._idle_reaper_task: Optional[asyncio.Task] = None  # 空闲回收任务
+        self._resident_max_use_count = int(max(1, getattr(config, "personal_resident_max_use_count", 2) or 2))
+        self._resident_fingerprint_cooldown_seconds = float(
+            max(0.0, getattr(config, "personal_resident_fingerprint_cooldown_seconds", 20.0) or 20.0)
+        )
         self._command_timeout_seconds = 8.0
         self._navigation_timeout_seconds = 20.0
         self._solve_timeout_seconds = 45.0
@@ -269,6 +773,7 @@ class BrowserCaptchaService:
         self._recaptcha_ready = False                    # 向后兼容
         self._last_fingerprint: Optional[Dict[str, Any]] = None
         self._resident_error_streaks: dict[str, int] = {}
+        self._project_flow_error_streaks: dict[str, int] = {}
         self._proxy_url: Optional[str] = None
         self._proxy_ext_dir: Optional[str] = None
         # 自定义站点打码常驻页（用于 score-test）
@@ -288,19 +793,392 @@ class BrowserCaptchaService:
                     )
         return cls._instance
 
+    @classmethod
+    def _build_fingerprint_profile(
+        cls,
+        *,
+        excluded_user_agents: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
+        seed = random.SystemRandom().randint(1, 2**31 - 1)
+        rng = random.Random(seed)
+        excluded_user_agents = {
+            str(user_agent or "").strip()
+            for user_agent in (excluded_user_agents or set())
+            if str(user_agent or "").strip()
+        }
+        available_templates = [
+            candidate
+            for candidate in cls._PROFILE_TEMPLATE_CANDIDATES
+            if str(candidate.get("user_agent") or "").strip() not in excluded_user_agents
+        ]
+        template_pool = available_templates or cls._PROFILE_TEMPLATE_CANDIDATES
+        template = dict(rng.choice(template_pool))
+        width, height = rng.choice(cls._PROFILE_VIEWPORT_CANDIDATES)
+        window_x = 2400 + rng.randint(0, 320)
+        window_y = 80 + rng.randint(0, 220)
+        lang = rng.choice(cls._PROFILE_LANG_CANDIDATES)
+        language_items = [part.strip() for part in lang.split(",") if part.strip()]
+        dpr = rng.choice([1, 1.25, 1.5, 2])
+        hardware_concurrency = rng.choice([4, 8, 12, 16])
+        device_memory = rng.choice([4, 8, 16])
+        max_touch_points = rng.choice([0, 0, 0, 1])
+        color_depth = rng.choice([24, 30])
+        screen_width = width + rng.choice([0, 64, 80, 96, 128])
+        screen_height = height + rng.choice([72, 80, 96, 120, 144])
+        return {
+            "user_agent": template.get("user_agent", ""),
+            "brands": template.get("brands", []),
+            "full_version_list": template.get("full_version_list", []),
+            "platform": template.get("platform", "Windows"),
+            "platform_version": template.get("platform_version", "10.0.0"),
+            "architecture": template.get("architecture", "x86"),
+            "bitness": template.get("bitness", "64"),
+            "model": template.get("model", ""),
+            "mobile": bool(template.get("mobile", False)),
+            "wow64": bool(template.get("wow64", False)),
+            "lang": lang,
+            "languages": language_items or ["en-US"],
+            "viewport": {"width": width, "height": height},
+            "window_position": {"x": window_x, "y": window_y},
+            "device_pixel_ratio": dpr,
+            "hardware_concurrency": hardware_concurrency,
+            "device_memory": device_memory,
+            "max_touch_points": max_touch_points,
+            "color_depth": color_depth,
+            "pixel_depth": color_depth,
+            "screen": {
+                "width": screen_width,
+                "height": screen_height,
+                "avail_width": screen_width,
+                "avail_height": max(height, screen_height - rng.choice([32, 40, 48])),
+            },
+            "seed": seed,
+        }
+
+    def _collect_active_tab_user_agents(self) -> set[str]:
+        active_user_agents: set[str] = set()
+        for profile in self._tab_fingerprint_profiles.values():
+            if not isinstance(profile, dict):
+                continue
+            user_agent = str(profile.get("user_agent") or "").strip()
+            if user_agent:
+                active_user_agents.add(user_agent)
+        return active_user_agents
+
+    def _build_unique_tab_fingerprint_profile(self) -> Dict[str, Any]:
+        return self._build_fingerprint_profile(
+            excluded_user_agents=self._collect_active_tab_user_agents(),
+        )
+
+    def _get_tab_fingerprint_profile(self, tab) -> Optional[Dict[str, Any]]:
+        if not tab:
+            return None
+        profile = self._tab_fingerprint_profiles.get(id(tab))
+        return dict(profile) if isinstance(profile, dict) else None
+
+    def _set_tab_fingerprint_profile(self, tab, profile: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not tab or not isinstance(profile, dict):
+            return None
+        stored_profile = dict(profile)
+        self._tab_fingerprint_profiles[id(tab)] = stored_profile
+        return dict(stored_profile)
+
+    def _clear_tab_fingerprint_profile(self, tab):
+        if not tab:
+            return
+        self._tab_fingerprint_profiles.pop(id(tab), None)
+
+    def _ensure_tab_fingerprint_profile(
+        self,
+        tab,
+        profile: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        existing_profile = self._get_tab_fingerprint_profile(tab)
+        if existing_profile:
+            return existing_profile
+        base_profile = profile if isinstance(profile, dict) else self._build_unique_tab_fingerprint_profile()
+        stored_profile = self._set_tab_fingerprint_profile(tab, base_profile) or dict(base_profile)
+        return stored_profile
+
+    def _build_user_agent_metadata(self, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        profile = profile or self._fingerprint_profile or {}
+        return {
+            "brands": profile.get("brands") or [],
+            "fullVersionList": profile.get("full_version_list") or [],
+            "platform": str(profile.get("platform") or "Windows"),
+            "platformVersion": str(profile.get("platform_version") or "10.0.0"),
+            "architecture": str(profile.get("architecture") or "x86"),
+            "bitness": str(profile.get("bitness") or "64"),
+            "model": str(profile.get("model") or ""),
+            "mobile": bool(profile.get("mobile", False)),
+            "wow64": bool(profile.get("wow64", False)),
+        }
+
+    def _build_cdp_user_agent_metadata(self, profile: Optional[Dict[str, Any]] = None):
+        profile = profile or self._fingerprint_profile or {}
+        cdp_module = getattr(uc, "cdp", None)
+        emulation = getattr(cdp_module, "emulation", None) if cdp_module else None
+        if emulation is None:
+            return None
+
+        brand_cls = getattr(emulation, "UserAgentBrandVersion", None)
+        metadata_cls = getattr(emulation, "UserAgentMetadata", None)
+        if brand_cls is None or metadata_cls is None:
+            return None
+
+        def build_brands(items):
+            if not isinstance(items, list):
+                return None
+            result = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                brand = str(item.get("brand") or "").strip()
+                version = str(item.get("version") or "").strip()
+                if not brand or not version:
+                    continue
+                result.append(brand_cls(brand=brand, version=version))
+            return result or None
+
+        return metadata_cls(
+            platform=str(profile.get("platform") or "Windows"),
+            platform_version=str(profile.get("platform_version") or "10.0.0"),
+            architecture=str(profile.get("architecture") or "x86"),
+            model=str(profile.get("model") or ""),
+            mobile=bool(profile.get("mobile", False)),
+            brands=build_brands(profile.get("brands")),
+            full_version_list=build_brands(profile.get("full_version_list")),
+            bitness=str(profile.get("bitness") or "64"),
+            wow64=bool(profile.get("wow64", False)),
+        )
+
+    def _build_fingerprint_injection_script(self, profile: Optional[Dict[str, Any]] = None) -> str:
+        profile = profile or self._fingerprint_profile or {}
+        languages = profile.get("languages") or ["en-US"]
+        if not isinstance(languages, list):
+            languages = ["en-US"]
+        payload = {
+            "userAgent": str(profile.get("user_agent") or ""),
+            "language": str(profile.get("lang") or languages[0] or "en-US"),
+            "languages": [str(item) for item in languages if str(item).strip()],
+            "devicePixelRatio": float(profile.get("device_pixel_ratio") or 1),
+            "hardwareConcurrency": int(profile.get("hardware_concurrency") or 8),
+            "deviceMemory": int(profile.get("device_memory") or 8),
+            "maxTouchPoints": int(profile.get("max_touch_points") or 0),
+            "colorDepth": int(profile.get("color_depth") or 24),
+            "pixelDepth": int(profile.get("pixel_depth") or 24),
+            "screen": profile.get("screen") or {},
+            "brands": profile.get("brands") or [],
+            "fullVersionList": profile.get("full_version_list") or [],
+            "platform": str(profile.get("platform") or "Windows"),
+            "platformVersion": str(profile.get("platform_version") or "10.0.0"),
+            "architecture": str(profile.get("architecture") or "x86"),
+            "bitness": str(profile.get("bitness") or "64"),
+            "model": str(profile.get("model") or ""),
+            "mobile": bool(profile.get("mobile", False)),
+            "wow64": bool(profile.get("wow64", False)),
+        }
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        return f"""
+            (() => {{
+                const profile = {payload_json};
+                const defineGetter = (target, key, value) => {{
+                    if (!target) return;
+                    try {{
+                        Object.defineProperty(target, key, {{
+                            get: () => value,
+                            configurable: true
+                        }});
+                    }} catch (e) {{}}
+                }};
+
+                defineGetter(Navigator.prototype, 'webdriver', undefined);
+                defineGetter(Navigator.prototype, 'userAgent', profile.userAgent);
+                defineGetter(Navigator.prototype, 'appVersion', profile.userAgent.replace(/^Mozilla\\//, ''));
+                defineGetter(Navigator.prototype, 'platform', profile.platform === 'Windows' ? 'Win32' : profile.platform);
+                defineGetter(Navigator.prototype, 'vendor', 'Google Inc.');
+                defineGetter(Navigator.prototype, 'language', profile.language);
+                defineGetter(Navigator.prototype, 'languages', profile.languages);
+                defineGetter(Navigator.prototype, 'hardwareConcurrency', profile.hardwareConcurrency);
+                defineGetter(Navigator.prototype, 'deviceMemory', profile.deviceMemory);
+                defineGetter(Navigator.prototype, 'maxTouchPoints', profile.maxTouchPoints);
+                defineGetter(window, 'devicePixelRatio', profile.devicePixelRatio);
+
+                const uaData = {{
+                    brands: profile.brands,
+                    mobile: profile.mobile,
+                    platform: profile.platform,
+                    getHighEntropyValues: async (hints) => {{
+                        const response = {{}};
+                        const requested = Array.isArray(hints) ? hints : [];
+                        for (const hint of requested) {{
+                            if (hint === 'architecture') response.architecture = profile.architecture;
+                            if (hint === 'bitness') response.bitness = profile.bitness;
+                            if (hint === 'formFactors') response.formFactors = profile.mobile ? ['Mobile'] : ['Desktop'];
+                            if (hint === 'fullVersionList') response.fullVersionList = profile.fullVersionList;
+                            if (hint === 'model') response.model = profile.model;
+                            if (hint === 'platform') response.platform = profile.platform;
+                            if (hint === 'platformVersion') response.platformVersion = profile.platformVersion;
+                            if (hint === 'uaFullVersion') response.uaFullVersion = (profile.fullVersionList[2] && profile.fullVersionList[2].version) || '';
+                            if (hint === 'wow64') response.wow64 = profile.wow64;
+                        }}
+                        return response;
+                    }}
+                }};
+                defineGetter(Navigator.prototype, 'userAgentData', uaData);
+
+                if (window.screen) {{
+                    defineGetter(window.screen, 'width', profile.screen.width);
+                    defineGetter(window.screen, 'height', profile.screen.height);
+                    defineGetter(window.screen, 'availWidth', profile.screen.avail_width);
+                    defineGetter(window.screen, 'availHeight', profile.screen.avail_height);
+                    defineGetter(window.screen, 'colorDepth', profile.colorDepth);
+                    defineGetter(window.screen, 'pixelDepth', profile.pixelDepth);
+                }}
+            }})()
+        """
+
+    async def _apply_tab_network_fingerprint_profile(
+        self,
+        tab,
+        profile: Optional[Dict[str, Any]] = None,
+        *,
+        label: str = "apply_tab_network_fingerprint_profile",
+    ):
+        if not tab:
+            return
+        effective_profile = profile or self._fingerprint_profile or {}
+        user_agent = str(effective_profile.get("user_agent") or "").strip()
+        if not user_agent:
+            return
+
+        accept_language = str(effective_profile.get("lang") or "").strip()
+        if not accept_language:
+            languages = effective_profile.get("languages") or []
+            if isinstance(languages, list) and languages:
+                accept_language = str(languages[0] or "").strip()
+        platform = str(effective_profile.get("platform") or "Windows")
+        cdp_module = getattr(uc, "cdp", None)
+        network = getattr(cdp_module, "network", None) if cdp_module else None
+        if network is None:
+            raise RuntimeError("nodriver.cdp.network 不可用，无法设置网络层 UA override")
+
+        send_method = getattr(tab, "send", None)
+        if send_method is None:
+            raise RuntimeError("nodriver tab.send 不可用，无法设置标签页网络层 UA override")
+
+        await self._run_with_timeout(
+            send_method(network.enable()),
+            self._command_timeout_seconds,
+            f"{label}:enable",
+        )
+        await self._run_with_timeout(
+            send_method(
+                network.set_user_agent_override(
+                    user_agent=user_agent,
+                    accept_language=accept_language or None,
+                    platform=platform,
+                    user_agent_metadata=self._build_cdp_user_agent_metadata(effective_profile),
+                )
+            ),
+            self._command_timeout_seconds,
+            f"{label}:override",
+        )
+        debug_logger.log_info(
+            "[BrowserCaptcha] tab_network_fingerprint_applied: "
+            f"label={label}, "
+            f"ua={user_agent[:160]}, "
+            f"accept_language={accept_language or '<empty>'}, "
+            f"platform={platform}, "
+            f"brands={json.dumps(self._build_user_agent_metadata(effective_profile).get('brands', []), ensure_ascii=False)[:220]}, "
+            f"full_versions={json.dumps(self._build_user_agent_metadata(effective_profile).get('fullVersionList', []), ensure_ascii=False)[:220]}"
+        )
+
+    async def _apply_tab_fingerprint_profile(
+        self,
+        tab,
+        label: str,
+        fingerprint_profile: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        profile = self._ensure_tab_fingerprint_profile(tab, fingerprint_profile)
+        try:
+            await self._apply_tab_network_fingerprint_profile(
+                tab,
+                profile,
+                label=f"{label}:network",
+            )
+        except Exception as network_error:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] tab_network_fingerprint_failed: label={label}, error={network_error}"
+            )
+        await self._tab_evaluate(
+            tab,
+            self._build_fingerprint_injection_script(profile),
+            label=label,
+            timeout_seconds=5.0,
+        )
+        try:
+            page_snapshot_raw = await self._tab_evaluate(
+                tab,
+                """
+                (async () => JSON.stringify({
+                    user_agent: navigator.userAgent || "",
+                    language: navigator.language || "",
+                    languages: Array.isArray(navigator.languages) ? navigator.languages : [],
+                    ua_data_brands: Array.isArray(navigator.userAgentData?.brands) ? navigator.userAgentData.brands : [],
+                    ua_data_mobile: typeof navigator.userAgentData?.mobile === "boolean" ? navigator.userAgentData.mobile : null,
+                    ua_data_platform: navigator.userAgentData?.platform || ""
+                }))()
+                """,
+                label=f"{label}:snapshot",
+                timeout_seconds=5.0,
+            )
+            page_snapshot = json.loads(page_snapshot_raw) if isinstance(page_snapshot_raw, str) and page_snapshot_raw else {}
+            if isinstance(page_snapshot, dict):
+                debug_logger.log_info(
+                    "[BrowserCaptcha] tab_fingerprint_applied: "
+                    f"label={label}, "
+                    f"profile_ua={str(profile.get('user_agent') or '')[:160]}, "
+                    f"page_ua={str(page_snapshot.get('user_agent') or '')[:160]}, "
+                    f"page_lang={str(page_snapshot.get('language') or '')}, "
+                    f"page_languages={json.dumps(page_snapshot.get('languages') or [], ensure_ascii=False)[:160]}, "
+                    f"page_brands={json.dumps(page_snapshot.get('ua_data_brands') or [], ensure_ascii=False)[:220]}, "
+                    f"page_platform={str(page_snapshot.get('ua_data_platform') or '')}, "
+                    f"page_mobile={page_snapshot.get('ua_data_mobile')}"
+                )
+        except Exception as snapshot_error:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] tab_fingerprint_snapshot_failed: label={label}, error={snapshot_error}"
+            )
+        return profile
+
     async def reload_config(self):
         """热更新配置（从数据库重新加载）"""
         from ..core.config import config
         old_max_tabs = self._max_resident_tabs
         old_idle_ttl = self._idle_tab_ttl_seconds
+        old_max_use_count = self._resident_max_use_count
+        old_fingerprint_cooldown = self._resident_fingerprint_cooldown_seconds
 
         self._max_resident_tabs = config.personal_max_resident_tabs
         self._idle_tab_ttl_seconds = config.personal_idle_tab_ttl_seconds
+        self._resident_max_use_count = int(
+            max(1, getattr(config, "personal_resident_max_use_count", old_max_use_count) or old_max_use_count)
+        )
+        self._resident_fingerprint_cooldown_seconds = float(
+            max(
+                0.0,
+                getattr(config, "personal_resident_fingerprint_cooldown_seconds", old_fingerprint_cooldown)
+                or old_fingerprint_cooldown,
+            )
+        )
 
         debug_logger.log_info(
             f"[BrowserCaptcha] Personal 配置已热更新: "
             f"max_tabs {old_max_tabs}->{self._max_resident_tabs}, "
-            f"idle_ttl {old_idle_ttl}s->{self._idle_tab_ttl_seconds}s"
+            f"idle_ttl {old_idle_ttl}s->{self._idle_tab_ttl_seconds}s, "
+            f"max_use_count {old_max_use_count}->{self._resident_max_use_count}, "
+            f"fingerprint_cooldown {old_fingerprint_cooldown}s->{self._resident_fingerprint_cooldown_seconds}s"
         )
 
     def _check_available(self):
@@ -486,6 +1364,46 @@ class BrowserCaptchaService:
         self._project_resident_affinity[normalized_project_id] = slot_id
         resident_info.project_id = normalized_project_id
 
+    def _is_resident_slot_rotation_due(
+        self,
+        resident_info: Optional[ResidentTabInfo],
+    ) -> bool:
+        if resident_info is None:
+            return False
+        return resident_info.use_count >= self._resident_max_use_count
+
+    def _is_resident_slot_cooling_down(
+        self,
+        resident_info: Optional[ResidentTabInfo],
+    ) -> bool:
+        if resident_info is None:
+            return False
+        if self._resident_fingerprint_cooldown_seconds <= 0:
+            return False
+        return (time.time() - resident_info.last_used_at) < self._resident_fingerprint_cooldown_seconds
+
+    def _pick_resident_slot_round_robin_locked(
+        self,
+        pool: list[tuple[str, ResidentTabInfo]],
+    ) -> tuple[Optional[str], Optional[ResidentTabInfo]]:
+        if not pool:
+            return None, None
+
+        ordered_pool = sorted(
+            pool,
+            key=lambda item: (item[1].created_at, item[0]),
+        )
+        start_index = 0
+        if self._resident_last_selected_order_key is not None:
+            for index, (slot_id, resident_info) in enumerate(ordered_pool):
+                if (resident_info.created_at, slot_id) > self._resident_last_selected_order_key:
+                    start_index = index
+                    break
+
+        selected = ordered_pool[start_index]
+        self._resident_last_selected_order_key = (selected[1].created_at, selected[0])
+        return selected
+
     def _resolve_resident_slot_for_project_locked(
         self,
         project_id: Optional[str] = None,
@@ -512,28 +1430,36 @@ class BrowserCaptchaService:
 
         # 共享打码池不再按 project_id 绑定；这里只根据“是否就绪 / 是否空闲 / 使用历史”
         # 做全局选择，避免 4 token/4 project 时把请求硬绑定到固定 tab。
-        ready_idle = [
+        fresh_candidates = [
             (slot_id, resident_info)
             for slot_id, resident_info in candidates
+            if not self._is_resident_slot_rotation_due(resident_info)
+        ]
+        cooldown_free_candidates = [
+            (slot_id, resident_info)
+            for slot_id, resident_info in fresh_candidates
+            if not self._is_resident_slot_cooling_down(resident_info)
+        ]
+        effective_candidates = cooldown_free_candidates or fresh_candidates or candidates
+
+        ready_idle = [
+            (slot_id, resident_info)
+            for slot_id, resident_info in effective_candidates
             if resident_info.recaptcha_ready and not resident_info.solve_lock.locked()
         ]
         ready_busy = [
             (slot_id, resident_info)
-            for slot_id, resident_info in candidates
+            for slot_id, resident_info in effective_candidates
             if resident_info.recaptcha_ready and resident_info.solve_lock.locked()
         ]
         cold_idle = [
             (slot_id, resident_info)
-            for slot_id, resident_info in candidates
+            for slot_id, resident_info in effective_candidates
             if not resident_info.recaptcha_ready and not resident_info.solve_lock.locked()
         ]
 
-        pool = ready_idle or ready_busy or cold_idle or candidates
-        pool.sort(key=lambda item: (item[1].last_used_at, item[1].use_count, item[1].created_at, item[0]))
-
-        pick_index = self._resident_pick_index % len(pool)
-        self._resident_pick_index = (self._resident_pick_index + 1) % max(len(candidates), 1)
-        return pool[pick_index]
+        pool = ready_idle or ready_busy or cold_idle or effective_candidates
+        return self._pick_resident_slot_round_robin_locked(pool)
 
     async def _ensure_resident_tab(
         self,
@@ -659,6 +1585,7 @@ class BrowserCaptchaService:
     async def _close_tab_quietly(self, tab):
         if not tab:
             return
+        self._clear_tab_fingerprint_profile(tab)
         try:
             await self._run_with_timeout(
                 tab.close(),
@@ -689,8 +1616,10 @@ class BrowserCaptchaService:
         self.browser = None
         self._initialized = False
         self._last_fingerprint = None
+        self._tab_fingerprint_profiles.clear()
         self._cleanup_proxy_extension()
         self._proxy_url = None
+        self._project_flow_error_streaks.clear()
 
         async with self._resident_lock:
             resident_items = list(self._resident_tabs.values())
@@ -791,6 +1720,7 @@ class BrowserCaptchaService:
                 await self._shutdown_browser_runtime_locked(reason="initialize_recovery")
 
             try:
+                self._fingerprint_profile = self._build_fingerprint_profile()
                 if self.user_data_dir:
                     debug_logger.log_info(f"[BrowserCaptcha] 正在启动 nodriver 浏览器 (用户数据目录: {self.user_data_dir})...")
                     os.makedirs(self.user_data_dir, exist_ok=True)
@@ -843,6 +1773,12 @@ class BrowserCaptchaService:
                     self._proxy_url = f"{protocol}://{host}:{port}"
                     debug_logger.log_info(f"[BrowserCaptcha] Personal 浏览器代理: {self._proxy_url}")
 
+                profile = self._fingerprint_profile
+                viewport = profile.get("viewport") or {"width": 1280, "height": 720}
+                window_position = profile.get("window_position") or {"x": 3000, "y": 3000}
+                profile_lang = str(profile.get("lang") or "").strip() or "en-US"
+                profile_user_agent = str(profile.get("user_agent") or "").strip()
+
                 browser_args = [
                     '--disable-quic',
                     '--disable-features=UseDnsHttpsSvcb',
@@ -851,8 +1787,8 @@ class BrowserCaptchaService:
                     '--disable-gpu',
                     '--disable-infobars',
                     '--hide-scrollbars',
-                    '--window-size=1280,720',
-                    '--window-position=3000,3000',
+                    f"--window-size={int(viewport.get('width', 1280))},{int(viewport.get('height', 720))}",
+                    f"--window-position={int(window_position.get('x', 3000))},{int(window_position.get('y', 3000))}",
                     '--profile-directory=Default',
                     '--disable-background-networking',
                     '--disable-sync',
@@ -879,6 +1815,10 @@ class BrowserCaptchaService:
                     "[BrowserCaptcha] nodriver 启动上下文: "
                     f"docker={IS_DOCKER}, display={display_value or '<empty>'}, "
                     f"uid={effective_uid}, headless={self.headless}, sandbox=False, "
+                    f"profile_seed={profile.get('seed')}, "
+                    f"profile_ua={profile_user_agent[:120] if profile_user_agent else '<empty>'}, "
+                    f"profile_lang={profile_lang}, "
+                    f"profile_viewport={viewport.get('width')}x{viewport.get('height')}, "
                     f"executable={browser_executable_path or '<auto>'}, "
                     f"args={' '.join(browser_args)}"
                 )
@@ -896,7 +1836,6 @@ class BrowserCaptchaService:
                     timeout_seconds=30.0,
                     label="nodriver.start",
                 )
-
                 self._initialized = True
                 if self._idle_reaper_task is None or self._idle_reaper_task.done():
                     self._idle_reaper_task = asyncio.create_task(self._idle_tab_reaper_loop())
@@ -905,6 +1844,11 @@ class BrowserCaptchaService:
             except Exception as e:
                 self.browser = None
                 self._initialized = False
+                traceback_text = traceback.format_exc()
+                debug_logger.log_error(
+                    "[BrowserCaptcha] nodriver.start traceback:\n"
+                    f"{traceback_text}"
+                )
                 debug_logger.log_error(
                     "[BrowserCaptcha] ❌ 浏览器启动失败: "
                     f"{type(e).__name__}: {str(e)} | "
@@ -1140,6 +2084,11 @@ class BrowserCaptchaService:
                 if not await self._wait_for_document_ready(resident_info.tab, retries=30, interval_seconds=1.0):
                     debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id}, slot={slot_id} 清理后页面加载超时")
                     return False
+
+                await self._apply_tab_fingerprint_profile(
+                    resident_info.tab,
+                    label=f"clear_resident_apply_fingerprint:{slot_id or project_id}",
+                )
 
                 resident_info.recaptcha_ready = await self._wait_for_recaptcha(resident_info.tab)
                 if resident_info.recaptcha_ready:
@@ -1643,39 +2592,61 @@ class BrowserCaptchaService:
     async def _extract_tab_fingerprint(self, tab) -> Optional[Dict[str, Any]]:
         """从 nodriver 标签页提取浏览器指纹信息。"""
         try:
-            fingerprint = await self._tab_evaluate(tab, """
-                () => {
+            fingerprint = None
+            raw_fingerprint = await self._tab_evaluate(tab, """
+                (async () => {
                     const ua = navigator.userAgent || "";
                     const lang = navigator.language || "";
+                    const languages = Array.isArray(navigator.languages) ? navigator.languages : [];
                     const uaData = navigator.userAgentData || null;
-                    let secChUa = "";
-                    let secChUaMobile = "";
-                    let secChUaPlatform = "";
-
-                    if (uaData) {
-                        if (Array.isArray(uaData.brands) && uaData.brands.length > 0) {
-                            secChUa = uaData.brands
-                                .map((item) => `"${item.brand}";v="${item.version}"`)
-                                .join(", ");
-                        }
-                        secChUaMobile = uaData.mobile ? "?1" : "?0";
-                        if (uaData.platform) {
-                            secChUaPlatform = `"${uaData.platform}"`;
+                    let highEntropy = null;
+                    if (uaData && typeof uaData.getHighEntropyValues === "function") {
+                        try {
+                            highEntropy = await uaData.getHighEntropyValues([
+                                "architecture",
+                                "bitness",
+                                "formFactors",
+                                "fullVersionList",
+                                "model",
+                                "platform",
+                                "platformVersion",
+                                "uaFullVersion",
+                                "wow64"
+                            ]);
+                        } catch (error) {
+                            highEntropy = {
+                                _error: String(error && error.message ? error.message : error || "")
+                            };
                         }
                     }
-
-                    return {
+                    return JSON.stringify({
                         user_agent: ua,
                         accept_language: lang,
-                        sec_ch_ua: secChUa,
-                        sec_ch_ua_mobile: secChUaMobile,
-                        sec_ch_ua_platform: secChUaPlatform,
-                    };
-                }
+                        languages,
+                        brands: Array.isArray(uaData?.brands) ? uaData.brands : [],
+                        mobile: typeof uaData?.mobile === "boolean" ? uaData.mobile : null,
+                        platform: uaData?.platform || "",
+                        architecture: highEntropy?.architecture || "",
+                        bitness: highEntropy?.bitness || "",
+                        model: highEntropy?.model || "",
+                        platform_version: highEntropy?.platformVersion || "",
+                        wow64: typeof highEntropy?.wow64 === "boolean" ? highEntropy.wow64 : null,
+                        full_version_list: Array.isArray(highEntropy?.fullVersionList) ? highEntropy.fullVersionList : [],
+                        ua_full_version: highEntropy?.uaFullVersion || "",
+                        high_entropy_error: highEntropy?._error || "",
+                    });
+                })()
             """, label="extract_tab_fingerprint", timeout_seconds=8.0)
+            if isinstance(raw_fingerprint, str) and raw_fingerprint:
+                try:
+                    fingerprint = json.loads(raw_fingerprint)
+                except Exception as parse_error:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] extract_tab_fingerprint JSON 解析失败: {parse_error}, raw={raw_fingerprint[:300]}"
+                    )
             if not isinstance(fingerprint, dict):
                 debug_logger.log_warning(
-                    f"[BrowserCaptcha] extract_tab_fingerprint 返回非 dict: type={type(fingerprint).__name__}, value={str(fingerprint)[:300]}"
+                    f"[BrowserCaptcha] extract_tab_fingerprint 返回非 dict: type={type(raw_fingerprint).__name__}, value={str(raw_fingerprint)[:300]}"
                 )
                 try:
                     fallback_ua = await self._tab_evaluate(
@@ -1700,25 +2671,239 @@ class BrowserCaptchaService:
                     )
                     return None
 
-            result: Dict[str, Any] = {"proxy_url": self._proxy_url}
-            for key in ("user_agent", "accept_language", "sec_ch_ua", "sec_ch_ua_mobile", "sec_ch_ua_platform"):
-                value = fingerprint.get(key)
+            if config.debug_enabled:
+                raw_full_version_list = fingerprint.get("full_version_list")
+                raw_platform_version = fingerprint.get("platform_version")
+                raw_brands = fingerprint.get("brands")
+                high_entropy_error = fingerprint.get("high_entropy_error")
+                debug_logger.log_info(
+                    "[BrowserCaptcha] high_entropy_raw: "
+                    f"brands={json.dumps(raw_brands, ensure_ascii=False)[:300]}, "
+                    f"full_version_list={json.dumps(raw_full_version_list, ensure_ascii=False)[:300]}, "
+                    f"platform_version={raw_platform_version!r}, "
+                    f"arch={fingerprint.get('architecture', '')!r}, "
+                    f"bitness={fingerprint.get('bitness', '')!r}, "
+                    f"model={fingerprint.get('model', '')!r}, "
+                    f"wow64={fingerprint.get('wow64', None)!r}, "
+                    f"error={high_entropy_error!r}"
+                )
+
+            preferred_profile = self._get_tab_fingerprint_profile(tab) or self._fingerprint_profile or {}
+            merged_fingerprint = dict(fingerprint)
+            for key in (
+                "user_agent",
+                "brands",
+                "full_version_list",
+                "mobile",
+                "platform",
+                "architecture",
+                "bitness",
+                "model",
+                "platform_version",
+                "wow64",
+            ):
+                profile_value = preferred_profile.get(key)
+                if profile_value not in (None, "", [], {}):
+                    merged_fingerprint[key] = profile_value
+
+            result: Dict[str, Any] = self._normalize_fingerprint_payload(merged_fingerprint)
+            result["proxy_url"] = self._proxy_url
+            for key in (
+                "user_agent",
+                "accept_language",
+                "sec_ch_ua",
+                "sec_ch_ua_mobile",
+                "sec_ch_ua_platform",
+                "sec_ch_ua_full_version_list",
+                "sec_ch_ua_arch",
+                "sec_ch_ua_bitness",
+                "sec_ch_ua_model",
+                "sec_ch_ua_platform_version",
+                "sec_ch_ua_wow64",
+            ):
+                value = merged_fingerprint.get(key)
                 if isinstance(value, str) and value:
                     result[key] = value
             if len(result) <= 1:
                 debug_logger.log_warning(
-                    f"[BrowserCaptcha] extract_tab_fingerprint 结果为空: raw={str(fingerprint)[:300]}"
+                    f"[BrowserCaptcha] extract_tab_fingerprint 结果为空: raw={str(merged_fingerprint)[:300]}"
                 )
                 return None
             debug_logger.log_info(
                 f"[BrowserCaptcha] extract_tab_fingerprint 成功: ua={result.get('user_agent', '')[:120]}, "
                 f"lang={result.get('accept_language', '')}, sec_ch_ua={'yes' if result.get('sec_ch_ua') else 'no'}, "
-                f"sec_ch_mobile={result.get('sec_ch_ua_mobile', '')}, sec_ch_platform={result.get('sec_ch_ua_platform', '')}"
+                f"sec_ch_mobile={result.get('sec_ch_ua_mobile', '')}, sec_ch_platform={result.get('sec_ch_ua_platform', '')}, "
+                f"full_version={'yes' if result.get('sec_ch_ua_full_version_list') else 'no'}"
             )
             return result
         except Exception as e:
             debug_logger.log_warning(f"[BrowserCaptcha] 提取 nodriver 指纹失败: {e}")
             return None
+
+    def _normalize_fingerprint_payload(self, fingerprint: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Normalize raw browser data into request-ready client hints."""
+        if not isinstance(fingerprint, dict):
+            return {}
+
+        result: Dict[str, Any] = {}
+        user_agent = fingerprint.get("user_agent")
+        if isinstance(user_agent, str) and user_agent:
+            result["user_agent"] = user_agent
+
+        accept_language = fingerprint.get("accept_language")
+        if isinstance(accept_language, str) and accept_language:
+            result["accept_language"] = accept_language
+
+        brands = fingerprint.get("brands")
+        if isinstance(brands, list) and brands:
+            sec_ch_ua = self._format_sec_ch_brands(brands)
+            if sec_ch_ua:
+                result["sec_ch_ua"] = sec_ch_ua
+
+        full_version_list = fingerprint.get("full_version_list")
+        if isinstance(full_version_list, list) and full_version_list:
+            rendered_full_version_list = self._format_sec_ch_brands(full_version_list)
+            if rendered_full_version_list:
+                result["sec_ch_ua_full_version_list"] = rendered_full_version_list
+
+        mobile = fingerprint.get("mobile")
+        if isinstance(mobile, bool):
+            result["sec_ch_ua_mobile"] = "?1" if mobile else "?0"
+
+        platform = fingerprint.get("platform")
+        if isinstance(platform, str) and platform:
+            result["sec_ch_ua_platform"] = json.dumps(platform)
+
+        architecture = fingerprint.get("architecture")
+        if isinstance(architecture, str) and architecture:
+            result["sec_ch_ua_arch"] = json.dumps(architecture)
+
+        bitness = fingerprint.get("bitness")
+        if isinstance(bitness, str) and bitness:
+            result["sec_ch_ua_bitness"] = json.dumps(bitness)
+
+        model = fingerprint.get("model")
+        if isinstance(model, str):
+            result["sec_ch_ua_model"] = json.dumps(model)
+
+        platform_version = fingerprint.get("platform_version")
+        if isinstance(platform_version, str) and platform_version:
+            result["sec_ch_ua_platform_version"] = json.dumps(platform_version)
+
+        wow64 = fingerprint.get("wow64")
+        if isinstance(wow64, bool):
+            result["sec_ch_ua_wow64"] = "?1" if wow64 else "?0"
+
+        self._fill_missing_client_hints_from_ua(result)
+        return result
+
+    def _format_sec_ch_brands(self, brands: Any) -> str:
+        if not isinstance(brands, list):
+            return ""
+        rendered = []
+        for item in brands:
+            if not isinstance(item, dict):
+                continue
+            brand = str(item.get("brand") or "").strip()
+            version = str(item.get("version") or "").strip()
+            if not brand or not version:
+                continue
+            rendered.append(f"\"{brand}\";v=\"{version}\"")
+        return ", ".join(rendered)
+
+    def _fill_missing_client_hints_from_ua(self, result: Dict[str, Any]):
+        """Derive conservative Chromium client hints from UA when JS APIs are unavailable."""
+        user_agent = str(result.get("user_agent") or "")
+        if not user_agent:
+            return
+
+        platform = ""
+        platform_version = ""
+        mobile = "?0"
+        arch = ""
+        bitness = ""
+        model = ""
+        wow64 = "?0"
+
+        chrome_match = re.search(r"Chrome/([0-9.]+)", user_agent)
+        edge_match = re.search(r"Edg/([0-9.]+)", user_agent)
+        chrome_version = chrome_match.group(1) if chrome_match else ""
+        edge_version = edge_match.group(1) if edge_match else ""
+        major_version = (edge_version or chrome_version).split(".")[0] if (edge_version or chrome_version) else ""
+
+        if "Windows NT" in user_agent:
+            platform = "Windows"
+            nt_match = re.search(r"Windows NT ([0-9.]+)", user_agent)
+            if nt_match:
+                platform_version = nt_match.group(1)
+            if "WOW64" in user_agent:
+                wow64 = "?1"
+        elif "Android" in user_agent:
+            platform = "Android"
+            mobile = "?1"
+            android_match = re.search(r"Android ([0-9.]+)", user_agent)
+            if android_match:
+                platform_version = android_match.group(1)
+            model_match = re.search(r"Android [^;]+; ([^)]+)\)", user_agent)
+            if model_match:
+                model = model_match.group(1).strip()
+        elif "Mac OS X" in user_agent:
+            platform = "macOS"
+            mac_match = re.search(r"Mac OS X ([0-9_]+)", user_agent)
+            if mac_match:
+                platform_version = mac_match.group(1).replace("_", ".")
+        elif "iPhone" in user_agent or "iPad" in user_agent:
+            platform = "iOS"
+            mobile = "?1"
+            ios_match = re.search(r"OS ([0-9_]+)", user_agent)
+            if ios_match:
+                platform_version = ios_match.group(1).replace("_", ".")
+        elif "Linux" in user_agent:
+            platform = "Linux"
+
+        ua_lower = user_agent.lower()
+        if "arm64" in ua_lower or "aarch64" in ua_lower:
+            arch = "arm"
+            bitness = "64"
+        elif "x86_64" in ua_lower or "win64" in ua_lower or "x64" in ua_lower:
+            arch = "x86"
+            bitness = "64"
+        elif "i686" in ua_lower or "i386" in ua_lower:
+            arch = "x86"
+            bitness = "32"
+
+        if major_version:
+            if edge_version:
+                result.setdefault(
+                    "sec_ch_ua",
+                    f"\"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"{major_version}\", \"Microsoft Edge\";v=\"{major_version}\""
+                )
+                result.setdefault(
+                    "sec_ch_ua_full_version_list",
+                    f"\"Not.A/Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"{chrome_version or edge_version}\", \"Microsoft Edge\";v=\"{edge_version}\""
+                )
+            elif chrome_version:
+                result.setdefault(
+                    "sec_ch_ua",
+                    f"\"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"{major_version}\", \"Google Chrome\";v=\"{major_version}\""
+                )
+                result.setdefault(
+                    "sec_ch_ua_full_version_list",
+                    f"\"Not.A/Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"{chrome_version}\", \"Google Chrome\";v=\"{chrome_version}\""
+                )
+
+        if platform:
+            result.setdefault("sec_ch_ua_platform", json.dumps(platform))
+        if platform_version:
+            result.setdefault("sec_ch_ua_platform_version", json.dumps(platform_version))
+        if mobile:
+            result.setdefault("sec_ch_ua_mobile", mobile)
+        if arch:
+            result.setdefault("sec_ch_ua_arch", json.dumps(arch))
+        if bitness:
+            result.setdefault("sec_ch_ua_bitness", json.dumps(bitness))
+        result.setdefault("sec_ch_ua_model", json.dumps(model))
+        result.setdefault("sec_ch_ua_wow64", wow64)
 
     # ========== 主要 API ==========
 
@@ -1757,6 +2942,18 @@ class BrowserCaptchaService:
             f"[BrowserCaptcha] ✅ 共享标签页可用 (slot={slot_id}, project={project_id}, use_count={resident_info.use_count})"
         )
 
+        if resident_info and resident_info.tab and self._is_resident_slot_rotation_due(resident_info):
+            debug_logger.log_info(
+                f"[BrowserCaptcha] 共享标签页达到指纹轮换阈值，准备重建 "
+                f"(slot={slot_id}, project={project_id}, use_count={resident_info.use_count}, "
+                f"max_use_count={self._resident_max_use_count})"
+            )
+            slot_id, resident_info = await self._rebuild_resident_tab(
+                project_id,
+                slot_id=slot_id,
+                return_slot_key=True,
+            )
+
         if resident_info and resident_info.tab and not resident_info.recaptcha_ready:
             debug_logger.log_warning(
                 f"[BrowserCaptcha] 共享标签页未就绪，准备重建 cold slot={slot_id}, project={project_id}"
@@ -1788,6 +2985,16 @@ class BrowserCaptchaService:
                     self._remember_project_affinity(project_id, slot_id, resident_info)
                     self._resident_error_streaks.pop(slot_id, None)
                     self._last_fingerprint = await self._extract_tab_fingerprint(resident_info.tab)
+                    if isinstance(self._last_fingerprint, dict):
+                        debug_logger.log_info(
+                            "[BrowserCaptcha] token_success_fingerprint: "
+                            f"slot={slot_id}, "
+                            f"ua={str(self._last_fingerprint.get('user_agent') or '')[:160]}, "
+                            f"accept_language={str(self._last_fingerprint.get('accept_language') or '')}, "
+                            f"sec_ch_ua={str(self._last_fingerprint.get('sec_ch_ua') or '')[:220]}, "
+                            f"sec_ch_ua_platform={str(self._last_fingerprint.get('sec_ch_ua_platform') or '')}, "
+                            f"proxy={self._last_fingerprint.get('proxy_url')}"
+                        )
                     debug_logger.log_info(
                         f"[BrowserCaptcha] ✅ Token生成成功（slot={slot_id}, 耗时 {duration_ms:.0f}ms, 使用次数: {resident_info.use_count}）"
                     )
@@ -1823,6 +3030,16 @@ class BrowserCaptchaService:
                         self._remember_project_affinity(project_id, slot_id, resident_info)
                         self._resident_error_streaks.pop(slot_id, None)
                         self._last_fingerprint = await self._extract_tab_fingerprint(resident_info.tab)
+                        if isinstance(self._last_fingerprint, dict):
+                            debug_logger.log_info(
+                                "[BrowserCaptcha] token_success_fingerprint: "
+                                f"slot={slot_id}, "
+                                f"ua={str(self._last_fingerprint.get('user_agent') or '')[:160]}, "
+                                f"accept_language={str(self._last_fingerprint.get('accept_language') or '')}, "
+                                f"sec_ch_ua={str(self._last_fingerprint.get('sec_ch_ua') or '')[:220]}, "
+                                f"sec_ch_ua_platform={str(self._last_fingerprint.get('sec_ch_ua_platform') or '')}, "
+                                f"proxy={self._last_fingerprint.get('proxy_url')}"
+                            )
                         debug_logger.log_info(f"[BrowserCaptcha] ✅ 重建后 Token生成成功 (slot={slot_id})")
                         return token
                 except Exception:
@@ -1903,6 +3120,11 @@ class BrowserCaptchaService:
                 debug_logger.log_error(f"[BrowserCaptcha] 页面加载超时 (slot={slot_id}, project={project_id})")
                 await self._close_tab_quietly(tab)
                 return None
+
+            await self._apply_tab_fingerprint_profile(
+                tab,
+                label=f"resident_apply_fingerprint:{slot_id}",
+            )
 
             # 等待 reCAPTCHA 加载
             recaptcha_ready = await self._wait_for_recaptcha(tab)
@@ -2004,6 +3226,11 @@ class BrowserCaptchaService:
                         break
                     await tab.sleep(0.5)
 
+                await self._apply_tab_fingerprint_profile(
+                    tab,
+                    label=f"legacy_apply_fingerprint:{project_id}",
+                )
+
                 # 等待 reCAPTCHA 加载
                 recaptcha_ready = await self._wait_for_recaptcha(tab)
 
@@ -2023,6 +3250,16 @@ class BrowserCaptchaService:
 
                 if token:
                     self._last_fingerprint = await self._extract_tab_fingerprint(tab)
+                    if isinstance(self._last_fingerprint, dict):
+                        debug_logger.log_info(
+                            "[BrowserCaptcha] token_success_fingerprint: "
+                            f"slot=legacy:{project_id}, "
+                            f"ua={str(self._last_fingerprint.get('user_agent') or '')[:160]}, "
+                            f"accept_language={str(self._last_fingerprint.get('accept_language') or '')}, "
+                            f"sec_ch_ua={str(self._last_fingerprint.get('sec_ch_ua') or '')[:220]}, "
+                            f"sec_ch_ua_platform={str(self._last_fingerprint.get('sec_ch_ua_platform') or '')}, "
+                            f"proxy={self._last_fingerprint.get('proxy_url')}"
+                        )
                     debug_logger.log_info(f"[BrowserCaptcha] [Legacy] ✅ Token获取成功（耗时 {duration_ms:.0f}ms）")
                     return token
 
@@ -2176,6 +3413,11 @@ class BrowserCaptchaService:
                             break
                     except Exception:
                         pass
+
+                await self._apply_tab_fingerprint_profile(
+                    tab,
+                    label=f"refresh_session_apply_fingerprint:{slot_id}",
+                )
 
                 resident_info.recaptcha_ready = await self._wait_for_recaptcha(tab)
                 if not resident_info.recaptcha_ready:
@@ -2335,6 +3577,11 @@ class BrowserCaptchaService:
                     if not page_loaded:
                         raise RuntimeError("自定义页面加载超时")
 
+                    await self._apply_tab_fingerprint_profile(
+                        tab,
+                        label="custom_apply_fingerprint",
+                    )
+
                     if not custom_info.get("recaptcha_ready"):
                         recaptcha_ready = await self._wait_for_custom_recaptcha(
                             tab=tab,
@@ -2432,6 +3679,8 @@ class BrowserCaptchaService:
                                     "accept_language": fallback_lang or "",
                                     "proxy_url": self._proxy_url,
                                 }
+                                extracted_fingerprint = self._normalize_fingerprint_payload(extracted_fingerprint)
+                                extracted_fingerprint["proxy_url"] = self._proxy_url
                             except Exception:
                                 extracted_fingerprint = None
                         self._last_fingerprint = extracted_fingerprint
