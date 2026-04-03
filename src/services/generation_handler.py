@@ -772,7 +772,8 @@ class GenerationHandler:
         prompt: str,
         images: Optional[List[bytes]] = None,
         stream: bool = False,
-        base_url_override: Optional[str] = None
+        base_url_override: Optional[str] = None,
+        existing_request_log_id: Optional[int] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -795,7 +796,7 @@ class GenerationHandler:
         generation_result = self._create_generation_result()
         response_state = self._create_response_state()
         response_state["base_url"] = (base_url_override or "").strip().rstrip("/") or None
-        request_log_state: Dict[str, Any] = {"id": None, "progress": 0}
+        request_log_state: Dict[str, Any] = {"id": existing_request_log_id, "progress": 0}
 
         # 防止并发链路复用到上一次请求的指纹上下文
         if hasattr(self.flow_client, "clear_request_fingerprint"):

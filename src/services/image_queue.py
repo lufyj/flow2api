@@ -84,6 +84,12 @@ class ImageGenerationQueueService:
             "base_url_override": (base_url_override or "").strip() or None,
             "image_count": len(input_assets),
         }
+        request_log_id = await self._create_request_log(
+            job_id=job_id,
+            model=model,
+            prompt=prompt,
+            image_count=len(input_assets),
+        )
         job = GenerationJob(
             job_id=job_id,
             task_type="generate_image",
@@ -93,6 +99,7 @@ class ImageGenerationQueueService:
             progress=0,
             input_assets=input_assets,
             request_payload=request_payload,
+            request_log_id=request_log_id,
             max_retries=int(max(0, getattr(config, "image_queue_max_retries", 0) or 0)),
         )
         await self.db.create_generation_job(job)
@@ -151,12 +158,23 @@ class ImageGenerationQueueService:
         should_cleanup_inputs = False
 
         try:
+            await self._update_request_log(
+                job,
+                status_text="processing",
+                progress=max(5, int(job.progress or 0)),
+                response_payload={
+                    "status": "processing",
+                    "job_id": job.job_id,
+                    "worker_id": worker_id,
+                },
+            )
             async for chunk in self.generation_handler.handle_generation(
                 model=job.model,
                 prompt=job.prompt,
                 images=image_bytes if image_bytes else None,
                 stream=False,
                 base_url_override=base_url_override,
+                existing_request_log_id=job.request_log_id,
             ):
                 final_result = chunk
 
@@ -175,6 +193,13 @@ class ImageGenerationQueueService:
                     completed_at=time.time(),
                 )
                 should_cleanup_inputs = True
+                await self._update_request_log(
+                    job,
+                    status_text="failed",
+                    progress=100,
+                    response_payload=final_payload,
+                    status_code=self._extract_status_code(final_payload, default=400),
+                )
                 debug_logger.log_warning(
                     f"[IMAGE QUEUE] job={job.job_id} failed: {error_message}"
                 )
@@ -187,6 +212,13 @@ class ImageGenerationQueueService:
                     completed_at=time.time(),
                 )
                 should_cleanup_inputs = True
+                await self._update_request_log(
+                    job,
+                    status_text="completed",
+                    progress=100,
+                    response_payload=final_payload,
+                    status_code=self._extract_status_code(final_payload, default=200),
+                )
                 debug_logger.log_info(f"[IMAGE QUEUE] job={job.job_id} completed")
         except asyncio.CancelledError:
             debug_logger.log_warning(
@@ -203,6 +235,13 @@ class ImageGenerationQueueService:
                 completed_at=time.time(),
             )
             should_cleanup_inputs = True
+            await self._update_request_log(
+                job,
+                status_text="failed",
+                progress=100,
+                response_payload={"error": {"message": error_message}},
+                status_code=500,
+            )
             debug_logger.log_error(f"[IMAGE QUEUE] job={job.job_id} crashed: {error_message}")
         finally:
             if should_cleanup_inputs:
@@ -254,3 +293,72 @@ class ImageGenerationQueueService:
         if not text and isinstance(error, BaseException):
             text = type(error).__name__
         return text or "Unknown queue worker error"
+
+    async def _create_request_log(
+        self,
+        job_id: str,
+        model: str,
+        prompt: str,
+        image_count: int,
+    ) -> Optional[int]:
+        prompt_for_log = prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
+        request_payload = {
+            "job_id": job_id,
+            "model": model,
+            "prompt": prompt_for_log,
+            "has_images": image_count > 0,
+            "queued_via": "image_queue",
+        }
+        response_payload = {
+            "status": "queued",
+            "job_id": job_id,
+            "image_count": image_count,
+        }
+        try:
+            return await self.generation_handler._log_request(
+                token_id=None,
+                operation="generate_image",
+                request_data=request_payload,
+                response_data=response_payload,
+                status_code=102,
+                duration=0.0,
+                status_text="queued",
+                progress=0,
+            )
+        except Exception as exc:
+            debug_logger.log_warning(f"[IMAGE QUEUE] failed to create request log for {job_id}: {exc}")
+            return None
+
+    async def _update_request_log(
+        self,
+        job: GenerationJob,
+        *,
+        status_text: str,
+        progress: int,
+        response_payload: Dict[str, Any],
+        status_code: Optional[int] = None,
+    ):
+        if not job.request_log_id:
+            return
+
+        safe_status_code = int(status_code if status_code is not None else (200 if status_text == "completed" else 102))
+        try:
+            await self.db.update_request_log(
+                job.request_log_id,
+                status_text=status_text,
+                progress=max(0, min(100, int(progress))),
+                status_code=safe_status_code,
+                response_body=json.dumps(response_payload, ensure_ascii=False),
+            )
+        except Exception as exc:
+            debug_logger.log_warning(f"[IMAGE QUEUE] failed to update request log for {job.job_id}: {exc}")
+
+    def _extract_status_code(self, payload: Dict[str, Any], default: int) -> int:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            value = error.get("status_code")
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+        return int(default)
