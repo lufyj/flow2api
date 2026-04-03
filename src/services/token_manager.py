@@ -529,7 +529,10 @@ class TokenManager:
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试通过浏览器刷新 ST...")
 
             from .browser_captcha_personal import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(self.db)
+            service = await BrowserCaptchaService.get_instance_for_project(
+                self.db,
+                project_id=token.current_project_id,
+            )
 
             refresh_timeout_seconds = 45.0
             try:

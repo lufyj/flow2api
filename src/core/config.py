@@ -196,6 +196,26 @@ class Config:
         return self._config["flow"]["poll_interval"]
 
     @property
+    def image_queue_worker_count(self) -> int:
+        value = self._config.get("flow", {}).get("image_queue_worker_count", 2)
+        try:
+            return max(1, min(16, int(value)))
+        except Exception:
+            return 2
+
+    @property
+    def image_queue_max_retries(self) -> int:
+        value = self._config.get("flow", {}).get("image_queue_max_retries", 0)
+        try:
+            return max(0, min(10, int(value)))
+        except Exception:
+            return 0
+
+    @property
+    def image_queue_default_async(self) -> bool:
+        return bool(self._config.get("flow", {}).get("image_queue_default_async", False))
+
+    @property
     def max_poll_attempts(self) -> int:
         return self._config["flow"]["max_poll_attempts"]
 

@@ -14,6 +14,7 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
+from .services.image_queue import ImageGenerationQueueService
 from .api import routes, admin
 
 
@@ -59,18 +60,55 @@ async def lifespan(app: FastAPI):
         print("✓ Browser captcha service initialized (nodriver mode)")
 
         warmup_limit = max(1, int(config.personal_max_resident_tabs or 1))
-        warmup_project_ids = await token_manager.get_personal_warmup_project_ids(
-            tokens=tokens,
-            limit=warmup_limit,
-        )
-
+        warmup_per_pool = int(max(0, getattr(config, "personal_startup_warmup_per_pool", 1) or 1))
         warmed_slots = []
+        warmed_pools = set()
         warmup_error = None
         try:
-            warmed_slots = await browser_service.warmup_resident_tabs(
-                warmup_project_ids,
-                limit=warmup_limit,
+            warmup_targets_by_pool = {}
+            for token in tokens:
+                if not token or not token.is_active:
+                    continue
+                project_id = str(getattr(token, "current_project_id", "") or "").strip()
+                if not project_id:
+                    project_id = f"warmup-token-{token.id}"
+                service = await BrowserCaptchaService.get_instance_for_token(db, token_id=token.id)
+                pool_key = getattr(service, "_pool_key", "__default__")
+                pool_info = warmup_targets_by_pool.setdefault(
+                    pool_key,
+                    {"service": service, "targets": []},
+                )
+                pool_info["targets"].append((token.id, project_id))
+
+            eligible_tokens = sum(len(pool_info["targets"]) for pool_info in warmup_targets_by_pool.values())
+            pool_limits = {}
+            if eligible_tokens > 0 and warmup_per_pool > 0:
+                remaining = warmup_limit
+                for pool_key, pool_info in warmup_targets_by_pool.items():
+                    if remaining <= 0:
+                        break
+                    target_count = len(pool_info["targets"])
+                    pool_limit = min(remaining, max(1, min(target_count, warmup_per_pool)))
+                    pool_limits[pool_key] = pool_limit
+                    remaining -= pool_limit
+
+            planned_slots = sum(pool_limits.values())
+            print(
+                f"✓ Browser captcha resident warmup plan "
+                f"(configured_max_tabs={warmup_limit}, warmup_per_pool={warmup_per_pool}, eligible_tokens={eligible_tokens}, pools={len(warmup_targets_by_pool)}, planned_tabs={planned_slots})"
             )
+
+            for pool_key, pool_info in warmup_targets_by_pool.items():
+                service = pool_info["service"]
+                pool_targets = pool_info["targets"]
+                pool_limit = max(0, int(pool_limits.get(pool_key, 0)))
+                if pool_limit <= 0 or not pool_targets:
+                    continue
+                print(f"  - pool={pool_key} tokens={len(pool_targets)} warmup_tabs={pool_limit}")
+                pool_slots = await service.warmup_resident_tabs_for_tokens(pool_targets, limit=pool_limit)
+                if pool_slots:
+                    warmed_slots.extend(pool_slots)
+                    warmed_pools.add(pool_key)
         except Exception as e:
             warmup_error = e
             print(
@@ -80,7 +118,7 @@ async def lifespan(app: FastAPI):
         if warmed_slots:
             print(
                 f"✓ Browser captcha shared resident tabs warmed "
-                f"({len(warmed_slots)} slot(s), limit={warmup_limit})"
+                f"({len(warmed_slots)} slot(s), pools={len(warmed_pools)}, configured_max_tabs={warmup_limit})"
             )
         elif warmup_error is not None:
             print("⚠ Browser captcha resident warmup skipped for this startup")
@@ -108,6 +146,7 @@ async def lifespan(app: FastAPI):
 
     # Start file cache cleanup task
     await generation_handler.file_cache.start_cleanup_task()
+    await image_queue_service.start()
 
     # Start 429 auto-unban task
     import asyncio
@@ -128,6 +167,7 @@ async def lifespan(app: FastAPI):
     print(f"✓ File cache cleanup task started")
     print(f"✓ 429 auto-unban task started (runs every hour)")
     print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
+    print(f"Image queue workers: {image_queue_service.worker_count}")
     print("=" * 60)
 
     yield
@@ -136,6 +176,7 @@ async def lifespan(app: FastAPI):
     print("Flow2API Shutting down...")
     # Stop file cache cleanup task
     await generation_handler.file_cache.stop_cleanup_task()
+    await image_queue_service.stop()
     # Stop auto-unban task
     auto_unban_task_handle.cancel()
     try:
@@ -166,8 +207,12 @@ generation_handler = GenerationHandler(
     proxy_manager  # 添加 proxy_manager 参数
 )
 
+# Queue service
+image_queue_service = ImageGenerationQueueService(db, generation_handler)
+
 # Set dependencies
 routes.set_generation_handler(generation_handler)
+routes.set_image_queue_service(image_queue_service)
 admin.set_dependencies(token_manager, proxy_manager, db, concurrency_manager)
 
 # Create FastAPI app

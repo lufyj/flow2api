@@ -37,7 +37,16 @@ class FlowClient:
             "flow_request_fingerprint",
             default=None
         )
+        self._submit_gate_ctx: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+            "flow_submit_gate",
+            default=None
+        )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
+        self._submit_gate_lock = asyncio.Lock()
+        self._submit_spacing_lock = asyncio.Lock()
+        self._token_submit_gates: Dict[str, asyncio.Semaphore] = {}
+        self._pool_submit_gates: Dict[str, asyncio.Semaphore] = {}
+        self._pool_submit_next_allowed_at: Dict[str, float] = {}
 
         # Default "real browser" headers (Android Chrome style) to reduce upstream 4xx/5xx instability.
         # These will be applied as defaults (won't override caller-provided headers).
@@ -55,6 +64,124 @@ class FlowClient:
         }
         # 发车策略改为“请求到就发”：
         # 不在 flow2api 本地对提交做批次整形或排队，避免把同批请求打成阶梯。
+
+    def _get_submit_gate_limits(self) -> tuple[int, int, float, float]:
+        token_limit = int(max(0, getattr(config, "flow_submit_token_concurrency", 2) or 2))
+        pool_limit = int(max(0, getattr(config, "flow_submit_pool_concurrency", 0) or 0))
+        queue_timeout = float(max(1.0, getattr(config, "flow_submit_queue_timeout_seconds", 30.0) or 30.0))
+        pool_spacing = float(max(0.0, getattr(config, "flow_submit_pool_min_interval_seconds", 3) or 0.0))
+        return token_limit, pool_limit, queue_timeout, pool_spacing
+
+    async def _reserve_submit_spacing(self, pool_key: str, spacing_seconds: float) -> int:
+        if spacing_seconds <= 0:
+            return 0
+
+        async with self._submit_spacing_lock:
+            now = time.time()
+            reserved_start = max(now, self._pool_submit_next_allowed_at.get(pool_key, 0.0))
+            self._pool_submit_next_allowed_at[pool_key] = reserved_start + spacing_seconds
+
+        wait_seconds = max(0.0, reserved_start - time.time())
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
+        return int(wait_seconds * 1000)
+
+    async def _resolve_submit_pool_key(self, token_id: Optional[int]) -> str:
+        fingerprint = self._request_fingerprint_ctx.get()
+        if isinstance(fingerprint, dict):
+            proxy_url = fingerprint.get("proxy_url")
+            if proxy_url:
+                return str(proxy_url)
+        if self.db is not None and token_id:
+            try:
+                token = await self.db.get_token(int(token_id))
+                proxy_url = str(getattr(token, "captcha_proxy_url", "") or "").strip()
+                if proxy_url:
+                    return proxy_url
+            except Exception:
+                pass
+        return "__default__"
+
+    async def _get_or_create_submit_gate(
+        self,
+        gate_map: Dict[str, asyncio.Semaphore],
+        key: str,
+        limit: int,
+    ) -> asyncio.Semaphore:
+        async with self._submit_gate_lock:
+            gate = gate_map.get(key)
+            if gate is None:
+                gate = asyncio.Semaphore(limit)
+                gate_map[key] = gate
+            return gate
+
+    async def _acquire_generation_submit_gate(
+        self,
+        token_id: Optional[int],
+        *,
+        generation_kind: str,
+    ) -> int:
+        token_limit, pool_limit, queue_timeout, pool_spacing = self._get_submit_gate_limits()
+        if token_limit <= 0 and pool_limit <= 0 and pool_spacing <= 0:
+            self._submit_gate_ctx.set(None)
+            return 0
+
+        gate_started_at = time.time()
+        token_key = f"token:{int(token_id)}" if token_id else None
+        pool_key = await self._resolve_submit_pool_key(token_id)
+        token_gate = None
+        pool_gate = None
+        token_acquired = False
+        pool_acquired = False
+
+        try:
+            if token_limit > 0 and token_key:
+                token_gate = await self._get_or_create_submit_gate(self._token_submit_gates, token_key, token_limit)
+                await asyncio.wait_for(token_gate.acquire(), timeout=queue_timeout)
+                token_acquired = True
+
+            remaining_timeout = max(1.0, queue_timeout - (time.time() - gate_started_at))
+            if pool_limit > 0:
+                pool_gate = await self._get_or_create_submit_gate(self._pool_submit_gates, pool_key, pool_limit)
+                await asyncio.wait_for(pool_gate.acquire(), timeout=remaining_timeout)
+                pool_acquired = True
+
+            spacing_ms = await self._reserve_submit_spacing(pool_key, pool_spacing)
+
+            queue_ms = int((time.time() - gate_started_at) * 1000)
+            self._submit_gate_ctx.set(
+                {
+                    "token_gate": token_gate,
+                    "pool_gate": pool_gate,
+                    "token_acquired": token_acquired,
+                    "pool_acquired": pool_acquired,
+                    "pool_key": pool_key,
+                    "spacing_ms": spacing_ms,
+                }
+            )
+            if queue_ms > 0 or spacing_ms > 0:
+                debug_logger.log_info(
+                    f"[FLOW SUBMIT GATE] acquired kind={generation_kind}, token_id={token_id}, pool={pool_key}, "
+                    f"queue_ms={queue_ms}, spacing_ms={spacing_ms}, token_limit={token_limit}, pool_limit={pool_limit}"
+                )
+            return queue_ms
+        except Exception:
+            if pool_acquired and pool_gate is not None:
+                pool_gate.release()
+            if token_acquired and token_gate is not None:
+                token_gate.release()
+            self._submit_gate_ctx.set(None)
+            raise
+
+    def _release_generation_submit_gate(self):
+        handle = self._submit_gate_ctx.get()
+        if not handle:
+            return
+        self._submit_gate_ctx.set(None)
+        if handle.get("pool_acquired") and handle.get("pool_gate") is not None:
+            handle["pool_gate"].release()
+        if handle.get("token_acquired") and handle.get("token_gate") is not None:
+            handle["token_gate"].release()
 
     def _generate_user_agent(self, account_id: str = None) -> str:
         """基于账号ID生成固定的 User-Agent
@@ -516,11 +643,12 @@ class FlowClient:
         token_id: Optional[int],
         token_image_concurrency: Optional[int],
     ) -> tuple[bool, int, int]:
-        """图片请求不再做本地发车排队，直接进入取 token 并提交上游。"""
-        return True, 0, 0
+        """图片生成在本地先排提交队列，再打码，再立即提交上游。"""
+        queue_ms = await self._acquire_generation_submit_gate(token_id, generation_kind="image")
+        return True, queue_ms, 0
 
     async def _release_image_launch_gate(self, token_id: Optional[int]):
-        """保留接口形状，当前无需释放任何本地发车状态。"""
+        self._release_generation_submit_gate()
         return
 
     async def _acquire_video_launch_gate(
@@ -528,11 +656,12 @@ class FlowClient:
         token_id: Optional[int],
         token_video_concurrency: Optional[int],
     ) -> tuple[bool, int, int]:
-        """视频请求不再做本地发车排队，直接进入取 token 并提交上游。"""
-        return True, 0, 0
+        """视频生成在本地先排提交队列，再打码，再立即提交上游。"""
+        queue_ms = await self._acquire_generation_submit_gate(token_id, generation_kind="video")
+        return True, queue_ms, 0
 
     async def _release_video_launch_gate(self, token_id: Optional[int]):
-        """保留接口形状，当前无需释放任何本地发车状态。"""
+        self._release_generation_submit_gate()
         return
 
     async def _make_image_generation_request(
@@ -560,11 +689,12 @@ class FlowClient:
                 has_media_proxy = False
         prefer_media_first = bool(has_media_proxy and config.flow_image_prefer_media_proxy)
 
-        if has_fingerprint_context and prefer_media_first:
+        if has_fingerprint_context:
             prefer_media_first = False
+            has_media_proxy = False
             debug_logger.log_info(
                 "[IMAGE] 检测到打码浏览器指纹上下文，首跳固定走打码链路；"
-                "媒体代理仅在网络超时时作为兜底回退。"
+                "整条生成链路固定沿用打码出口，不再切换到媒体代理。"
             )
 
         last_error: Optional[Exception] = None
@@ -599,7 +729,7 @@ class FlowClient:
                     at_token=at,
                     timeout=request_timeout,
                     use_media_proxy=prefer_media_proxy,
-                    respect_fingerprint_proxy=not prefer_media_proxy,
+                    respect_fingerprint_proxy=True,
                 )
                 if http_attempt_info is not None:
                     http_attempt_info["duration_ms"] = int((time.time() - http_attempt_started_at) * 1000)
@@ -1017,12 +1147,17 @@ class FlowClient:
                     action="IMAGE_GENERATION",
                     token_id=token_id
                 )
-            finally:
+            except Exception:
                 if launch_gate_acquired:
                     await self._release_image_launch_gate(token_id)
+                    launch_gate_acquired = False
+                raise
             attempt_trace["recaptcha_ms"] = int((time.time() - recaptcha_started_at) * 1000)
             attempt_trace["recaptcha_ok"] = bool(recaptcha_token)
             if not recaptcha_token:
+                if launch_gate_acquired:
+                    await self._release_image_launch_gate(token_id)
+                    launch_gate_acquired = False
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 attempt_trace["success"] = False
                 attempt_trace["error"] = str(last_error)
@@ -1076,6 +1211,7 @@ class FlowClient:
                 "requests": [request_data]
             }
 
+            request_finished_success = False
             try:
                 result = await self._make_image_generation_request(
                     url=url,
@@ -1087,6 +1223,7 @@ class FlowClient:
                 attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
                 perf_trace["generation_attempts"].append(attempt_trace)
                 perf_trace["final_success_attempt"] = retry_attempt + 1
+                request_finished_success = True
                 return result, session_id, perf_trace
             except Exception as e:
                 last_error = e
@@ -1106,7 +1243,14 @@ class FlowClient:
                     continue
                 raise
             finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
+                if launch_gate_acquired:
+                    await self._release_image_launch_gate(token_id)
+                    launch_gate_acquired = False
+                await self._notify_browser_captcha_request_finished(
+                    browser_id,
+                    project_id=project_id,
+                    success=request_finished_success,
+                )
         
         # 所有重试都失败
         perf_trace["final_success_attempt"] = None
@@ -1142,13 +1286,32 @@ class FlowClient:
         last_error = None
 
         for retry_attempt in range(max_retries):
-            # 获取 reCAPTCHA token - 使用 IMAGE_GENERATION action
-            recaptcha_token, browser_id = await self._get_recaptcha_token(
-                project_id,
-                action="IMAGE_GENERATION",
-                token_id=token_id
+            launch_gate_acquired = False
+            launch_ok, _, _ = await self._acquire_image_launch_gate(
+                token_id=token_id,
+                token_image_concurrency=None,
             )
+            if not launch_ok:
+                last_error = Exception("Image launch queue wait timeout")
+                raise last_error
+
+            launch_gate_acquired = True
+            try:
+                # 获取 reCAPTCHA token - 使用 IMAGE_GENERATION action
+                recaptcha_token, browser_id = await self._get_recaptcha_token(
+                    project_id,
+                    action="IMAGE_GENERATION",
+                    token_id=token_id
+                )
+            except Exception:
+                if launch_gate_acquired:
+                    await self._release_image_launch_gate(token_id)
+                    launch_gate_acquired = False
+                raise
             if not recaptcha_token:
+                if launch_gate_acquired:
+                    await self._release_image_launch_gate(token_id)
+                    launch_gate_acquired = False
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
                     retry_attempt=retry_attempt,
@@ -1178,6 +1341,7 @@ class FlowClient:
             }
 
             # 4K/2K 放大使用专用超时，因为返回的 base64 数据量很大
+            request_finished_success = False
             try:
                 result = await self._make_request(
                     method="POST",
@@ -1189,6 +1353,7 @@ class FlowClient:
                 )
 
                 # 返回 base64 编码的图片
+                request_finished_success = True
                 return result.get("encodedImage", "")
             except Exception as e:
                 last_error = e
@@ -1204,7 +1369,14 @@ class FlowClient:
                     continue
                 raise
             finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
+                if launch_gate_acquired:
+                    await self._release_image_launch_gate(token_id)
+                    launch_gate_acquired = False
+                await self._notify_browser_captcha_request_finished(
+                    browser_id,
+                    project_id=project_id,
+                    success=request_finished_success,
+                )
 
         raise last_error
 
@@ -1265,10 +1437,15 @@ class FlowClient:
                     action="VIDEO_GENERATION",
                     token_id=token_id
                 )
-            finally:
+            except Exception:
                 if launch_gate_acquired:
                     await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                raise
             if not recaptcha_token:
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
                     retry_attempt=retry_attempt,
@@ -1307,6 +1484,7 @@ class FlowClient:
                 }]
             }
 
+            request_finished_success = False
             try:
                 result = await self._make_request(
                     method="POST",
@@ -1315,6 +1493,7 @@ class FlowClient:
                     use_at=True,
                     at_token=at
                 )
+                request_finished_success = True
                 return result
             except Exception as e:
                 last_error = e
@@ -1330,7 +1509,14 @@ class FlowClient:
                     continue
                 raise
             finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                await self._notify_browser_captcha_request_finished(
+                    browser_id,
+                    project_id=project_id,
+                    success=request_finished_success,
+                )
         
         # 所有重试都失败
         raise last_error
@@ -1385,10 +1571,15 @@ class FlowClient:
                     action="VIDEO_GENERATION",
                     token_id=token_id
                 )
-            finally:
+            except Exception:
                 if launch_gate_acquired:
                     await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                raise
             if not recaptcha_token:
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
                     retry_attempt=retry_attempt,
@@ -1437,6 +1628,7 @@ class FlowClient:
                 "useV2ModelConfig": True
             }
 
+            request_finished_success = False
             try:
                 result = await self._make_request(
                     method="POST",
@@ -1445,6 +1637,7 @@ class FlowClient:
                     use_at=True,
                     at_token=at
                 )
+                request_finished_success = True
                 return result
             except Exception as e:
                 last_error = e
@@ -1460,7 +1653,14 @@ class FlowClient:
                     continue
                 raise
             finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                await self._notify_browser_captcha_request_finished(
+                    browser_id,
+                    project_id=project_id,
+                    success=request_finished_success,
+                )
         
         # 所有重试都失败
         raise last_error
@@ -1517,10 +1717,15 @@ class FlowClient:
                     action="VIDEO_GENERATION",
                     token_id=token_id
                 )
-            finally:
+            except Exception:
                 if launch_gate_acquired:
                     await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                raise
             if not recaptcha_token:
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
                     retry_attempt=retry_attempt,
@@ -1565,6 +1770,7 @@ class FlowClient:
                 }]
             }
 
+            request_finished_success = False
             try:
                 result = await self._make_request(
                     method="POST",
@@ -1573,6 +1779,7 @@ class FlowClient:
                     use_at=True,
                     at_token=at
                 )
+                request_finished_success = True
                 return result
             except Exception as e:
                 last_error = e
@@ -1588,7 +1795,14 @@ class FlowClient:
                     continue
                 raise
             finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                await self._notify_browser_captcha_request_finished(
+                    browser_id,
+                    project_id=project_id,
+                    success=request_finished_success,
+                )
         
         # 所有重试都失败
         raise last_error
@@ -1643,10 +1857,15 @@ class FlowClient:
                     action="VIDEO_GENERATION",
                     token_id=token_id
                 )
-            finally:
+            except Exception:
                 if launch_gate_acquired:
                     await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                raise
             if not recaptcha_token:
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
                     retry_attempt=retry_attempt,
@@ -1689,6 +1908,7 @@ class FlowClient:
                 }]
             }
 
+            request_finished_success = False
             try:
                 result = await self._make_request(
                     method="POST",
@@ -1697,6 +1917,7 @@ class FlowClient:
                     use_at=True,
                     at_token=at
                 )
+                request_finished_success = True
                 return result
             except Exception as e:
                 last_error = e
@@ -1712,7 +1933,14 @@ class FlowClient:
                     continue
                 raise
             finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                await self._notify_browser_captcha_request_finished(
+                    browser_id,
+                    project_id=project_id,
+                    success=request_finished_success,
+                )
         
         # 所有重试都失败
         raise last_error
@@ -1766,10 +1994,15 @@ class FlowClient:
                     action="VIDEO_GENERATION",
                     token_id=token_id
                 )
-            finally:
+            except Exception:
                 if launch_gate_acquired:
                     await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                raise
             if not recaptcha_token:
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
                     retry_attempt=retry_attempt,
@@ -1806,6 +2039,7 @@ class FlowClient:
                 }
             }
 
+            request_finished_success = False
             try:
                 result = await self._make_request(
                     method="POST",
@@ -1814,6 +2048,7 @@ class FlowClient:
                     use_at=True,
                     at_token=at
                 )
+                request_finished_success = True
                 return result
             except Exception as e:
                 last_error = e
@@ -1829,7 +2064,14 @@ class FlowClient:
                     continue
                 raise
             finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+                    launch_gate_acquired = False
+                await self._notify_browser_captcha_request_finished(
+                    browser_id,
+                    project_id=project_id,
+                    success=request_finished_success,
+                )
         
         raise last_error
 
@@ -2019,7 +2261,7 @@ class FlowClient:
         elif config.captcha_method == "personal" and project_id:
             try:
                 from .browser_captcha_personal import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
+                service = await BrowserCaptchaService.get_instance_for_project(self.db, project_id=project_id)
                 await service.report_flow_error(
                     project_id=project_id,
                     error_reason=error_reason or "",
@@ -2039,13 +2281,29 @@ class FlowClient:
             except Exception as e:
                 debug_logger.log_warning(f"[reCAPTCHA RemoteBrowser] 上报 error 失败: {e}")
 
-    async def _notify_browser_captcha_request_finished(self, browser_id: Optional[Union[int, str]] = None):
+    async def _notify_browser_captcha_request_finished(
+        self,
+        browser_id: Optional[Union[int, str]] = None,
+        project_id: Optional[str] = None,
+        success: Optional[bool] = None,
+    ):
         """通知有头浏览器：上游图片/视频请求已结束，可关闭对应打码浏览器。"""
         if config.captcha_method == "browser":
             try:
                 from .browser_captcha import BrowserCaptchaService
                 service = await BrowserCaptchaService.get_instance(self.db)
                 await service.report_request_finished(browser_id)
+            except Exception:
+                pass
+        elif config.captcha_method == "personal" and project_id:
+            try:
+                from .browser_captcha_personal import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance_for_project(self.db, project_id=project_id)
+                # Per-attempt upstream failures are already reported via
+                # _handle_retryable_generation_error(); only send positive completion
+                # here to avoid double-penalizing the same retry attempt.
+                if success is True:
+                    await service.report_request_finished(project_id=project_id, success=bool(success))
             except Exception:
                 pass
         elif config.captcha_method == "remote_browser" and browser_id:
@@ -2326,9 +2584,9 @@ class FlowClient:
             try:
                 from .browser_captcha_personal import BrowserCaptchaService
                 debug_logger.log_info(f"[reCAPTCHA] 导入 BrowserCaptchaService 成功")
-                service = await BrowserCaptchaService.get_instance(self.db)
+                service = await BrowserCaptchaService.get_instance_for_token(self.db, token_id=token_id)
                 debug_logger.log_info(f"[reCAPTCHA] 获取服务实例成功，准备调用 get_token")
-                token = await service.get_token(project_id, action)
+                token = await service.get_token(project_id, action, token_id=token_id)
                 debug_logger.log_info(f"[reCAPTCHA] get_token 返回: {token[:50] if token else None}...")
                 fingerprint = service.get_last_fingerprint() if token else None
                 self._set_request_fingerprint(fingerprint if token else None)
@@ -2342,16 +2600,18 @@ class FlowClient:
                 debug_logger.log_error(f"[reCAPTCHA Personal] {error_msg}")
                 print(f"[reCAPTCHA] ❌ 内置浏览器打码失败: {error_msg}")
                 self._set_request_fingerprint(None)
-                return None, None
+                raise RuntimeError(f"Personal captcha runtime failure: {error_msg}") from e
             except ImportError as e:
                 debug_logger.log_error(f"[reCAPTCHA Personal] 导入失败: {str(e)}")
                 print(f"[reCAPTCHA] ❌ nodriver 未安装，请运行: pip install nodriver")
                 self._set_request_fingerprint(None)
-                return None, None
+                raise RuntimeError(f"Personal captcha import failure: {str(e)}") from e
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Personal] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
-                return None, None
+                raise RuntimeError(
+                    f"Personal captcha get_token failure: {type(e).__name__}: {str(e) or '<empty>'}"
+                ) from e
         # 有头浏览器打码 (playwright)
         elif captcha_method == "browser":
             try:

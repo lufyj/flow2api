@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig
+from .models import Token, TokenStats, Task, GenerationJob, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig
 
 
 class Database:
@@ -381,6 +381,34 @@ class Database:
                     )
                 """)
 
+            # Check and create generation_jobs table if missing
+            if not await self._table_exists(db, "generation_jobs"):
+                print("  Creating missing table: generation_jobs")
+                await db.execute("""
+                    CREATE TABLE generation_jobs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_id TEXT UNIQUE NOT NULL,
+                        task_type TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        prompt TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'queued',
+                        progress INTEGER DEFAULT 0,
+                        input_assets TEXT,
+                        request_payload TEXT,
+                        response_payload TEXT,
+                        error_message TEXT,
+                        token_id INTEGER,
+                        request_log_id INTEGER,
+                        worker_id TEXT,
+                        retry_count INTEGER DEFAULT 0,
+                        max_retries INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        started_at TIMESTAMP,
+                        completed_at TIMESTAMP,
+                        FOREIGN KEY (token_id) REFERENCES tokens(id)
+                    )
+                """)
+
             # ========== Step 2: Add missing columns to existing tables ==========
             # Check and add missing columns to tokens table
             if await self._table_exists(db, "tokens"):
@@ -504,6 +532,30 @@ class Database:
                             print(f"  ✓ Added column '{col_name}' to captcha_config table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+            # Check and add missing columns to generation_jobs table
+            if await self._table_exists(db, "generation_jobs"):
+                generation_job_columns_to_add = [
+                    ("input_assets", "TEXT"),
+                    ("request_payload", "TEXT"),
+                    ("response_payload", "TEXT"),
+                    ("error_message", "TEXT"),
+                    ("token_id", "INTEGER"),
+                    ("request_log_id", "INTEGER"),
+                    ("worker_id", "TEXT"),
+                    ("retry_count", "INTEGER DEFAULT 0"),
+                    ("max_retries", "INTEGER DEFAULT 0"),
+                    ("started_at", "TIMESTAMP"),
+                    ("completed_at", "TIMESTAMP"),
+                ]
+
+                for col_name, col_type in generation_job_columns_to_add:
+                    if not await self._column_exists(db, "generation_jobs", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE generation_jobs ADD COLUMN {col_name} {col_type}")
+                            print(f"  Added column '{col_name}' to generation_jobs table")
+                        except Exception as e:
+                            print(f"  Failed to add column '{col_name}' to generation_jobs table: {e}")
 
             # ========== Step 3: Ensure all config tables have default rows ==========
             # Note: This will NOT overwrite existing config rows
@@ -727,8 +779,36 @@ class Database:
                 )
             """)
 
+            # Durable generation queue table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS generation_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT UNIQUE NOT NULL,
+                    task_type TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    progress INTEGER DEFAULT 0,
+                    input_assets TEXT,
+                    request_payload TEXT,
+                    response_payload TEXT,
+                    error_message TEXT,
+                    token_id INTEGER,
+                    request_log_id INTEGER,
+                    worker_id TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
+
             # Create indexes
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_generation_jobs_status_created_at ON generation_jobs(status, created_at)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_generation_jobs_job_id ON generation_jobs(job_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_token_st ON tokens(st)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_project_id ON projects(project_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_email ON tokens(email)")
@@ -978,6 +1058,8 @@ class Database:
         """Delete token and related data"""
         async with self._connect(write=True) as db:
             await db.execute("DELETE FROM token_stats WHERE token_id = ?", (token_id,))
+            await db.execute("DELETE FROM tasks WHERE token_id = ?", (token_id,))
+            await db.execute("DELETE FROM request_logs WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM projects WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
             await db.commit()
@@ -1066,6 +1148,131 @@ class Database:
                 query = f"UPDATE tasks SET {', '.join(updates)} WHERE task_id = ?"
                 await db.execute(query, params)
                 await db.commit()
+
+    # Durable generation queue operations
+    async def create_generation_job(self, job: GenerationJob) -> int:
+        """Create a durable generation queue job."""
+        async with self._connect(write=True) as db:
+            cursor = await db.execute("""
+                INSERT INTO generation_jobs (
+                    job_id, task_type, model, prompt, status, progress,
+                    input_assets, request_payload, response_payload, error_message,
+                    token_id, request_log_id, worker_id, retry_count, max_retries,
+                    started_at, completed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                job.job_id,
+                job.task_type,
+                job.model,
+                job.prompt,
+                job.status,
+                job.progress,
+                json.dumps(job.input_assets, ensure_ascii=False) if job.input_assets is not None else None,
+                json.dumps(job.request_payload, ensure_ascii=False) if job.request_payload is not None else None,
+                json.dumps(job.response_payload, ensure_ascii=False) if job.response_payload is not None else None,
+                job.error_message,
+                job.token_id,
+                job.request_log_id,
+                job.worker_id,
+                job.retry_count,
+                job.max_retries,
+                job.started_at,
+                job.completed_at,
+            ))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_generation_job(self, job_id: str) -> Optional[GenerationJob]:
+        """Get a durable generation queue job by ID."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM generation_jobs WHERE job_id = ?", (job_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            job_dict = dict(row)
+            for field in ("input_assets", "request_payload", "response_payload"):
+                if job_dict.get(field):
+                    try:
+                        job_dict[field] = json.loads(job_dict[field])
+                    except Exception:
+                        job_dict[field] = None
+            return GenerationJob(**job_dict)
+
+    async def update_generation_job(self, job_id: str, **kwargs):
+        """Update a durable generation queue job."""
+        async with self._connect(write=True) as db:
+            updates = []
+            params = []
+            for key, value in kwargs.items():
+                if value is None:
+                    continue
+                if key in {"input_assets", "request_payload", "response_payload"} and not isinstance(value, str):
+                    value = json.dumps(value, ensure_ascii=False)
+                updates.append(f"{key} = ?")
+                params.append(value)
+
+            if updates:
+                params.append(job_id)
+                query = f"UPDATE generation_jobs SET {', '.join(updates)} WHERE job_id = ?"
+                await db.execute(query, params)
+                await db.commit()
+
+    async def claim_next_generation_job(self, task_type: str, worker_id: str) -> Optional[GenerationJob]:
+        """Atomically claim the oldest queued generation job for processing."""
+        async with self._connect(write=True) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT * FROM generation_jobs
+                WHERE task_type = ? AND status = 'queued'
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+            """, (task_type,))
+            row = await cursor.fetchone()
+            if not row:
+                return None
+
+            job_id = row["job_id"]
+            started_at = datetime.utcnow().isoformat()
+            update_cursor = await db.execute("""
+                UPDATE generation_jobs
+                SET status = 'processing',
+                    progress = CASE WHEN progress < 5 THEN 5 ELSE progress END,
+                    worker_id = ?,
+                    started_at = ?,
+                    error_message = NULL
+                WHERE job_id = ? AND status = 'queued'
+            """, (worker_id, started_at, job_id))
+            if (update_cursor.rowcount or 0) <= 0:
+                await db.rollback()
+                return None
+            await db.commit()
+        return await self.get_generation_job(job_id)
+
+    async def requeue_processing_generation_jobs(self, task_type: Optional[str] = None) -> int:
+        """Move interrupted processing jobs back to queued on startup."""
+        async with self._connect(write=True) as db:
+            if task_type:
+                cursor = await db.execute("""
+                    UPDATE generation_jobs
+                    SET status = 'queued',
+                        progress = CASE WHEN progress > 95 THEN 95 ELSE progress END,
+                        worker_id = NULL,
+                        started_at = NULL
+                    WHERE task_type = ? AND status = 'processing'
+                """, (task_type,))
+            else:
+                cursor = await db.execute("""
+                    UPDATE generation_jobs
+                    SET status = 'queued',
+                        progress = CASE WHEN progress > 95 THEN 95 ELSE progress END,
+                        worker_id = NULL,
+                        started_at = NULL
+                    WHERE status = 'processing'
+                """)
+            await db.commit()
+            return cursor.rowcount or 0
 
     # Token stats operations (kept for compatibility, now delegates to specific methods)
     async def increment_token_stats(self, token_id: int, stat_type: str):

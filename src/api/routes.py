@@ -6,6 +6,7 @@ import base64
 import json
 import mimetypes
 import re
+import time
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -13,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.auth import verify_api_key_flexible
+from ..core.config import config
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -43,6 +45,7 @@ GEMINI_STATUS_MAP = {
 
 # Dependency injection will be set up in main.py
 generation_handler: GenerationHandler = None
+image_queue_service = None
 
 
 @dataclass
@@ -61,10 +64,39 @@ def set_generation_handler(handler: GenerationHandler):
     generation_handler = handler
 
 
+def set_image_queue_service(service):
+    """Set durable image queue service instance."""
+    global image_queue_service
+    image_queue_service = service
+
+
 def _ensure_generation_handler() -> GenerationHandler:
     if generation_handler is None:
         raise HTTPException(status_code=500, detail="Generation handler not initialized")
     return generation_handler
+
+
+def _ensure_image_queue_service():
+    if image_queue_service is None:
+        raise HTTPException(status_code=500, detail="Image queue service not initialized")
+    return image_queue_service
+
+
+def _should_enqueue_async(raw_request: Request) -> bool:
+    """Only opt into durable queue mode when the client explicitly asks for it."""
+    query_async = str(raw_request.query_params.get("async", "")).strip().lower()
+    if query_async in {"1", "true", "yes"}:
+        return True
+
+    prefer = str(raw_request.headers.get("Prefer", "")).strip().lower()
+    if "respond-async" in prefer:
+        return True
+
+    x_async = str(raw_request.headers.get("X-Flow-Async", "")).strip().lower()
+    if x_async in {"1", "true", "yes"}:
+        return True
+
+    return bool(getattr(config, "image_queue_default_async", False))
 
 
 def _build_model_description(model_config: Dict[str, Any]) -> str:
@@ -415,6 +447,49 @@ async def _collect_non_stream_result(
         raise HTTPException(status_code=500, detail="Generation failed: No response")
 
     return result
+
+
+def _build_async_task_payload(
+    job: Any,
+    raw_request: Request,
+    model: str,
+) -> Dict[str, Any]:
+    base_url = _get_request_base_url(raw_request).rstrip("/")
+    status_url = f"{base_url}/v1/tasks/{job.job_id}"
+    return {
+        "id": job.job_id,
+        "object": "generation.task",
+        "created": int(time.time()),
+        "model": model,
+        "status": job.status,
+        "progress": job.progress,
+        "task": {
+            "id": job.job_id,
+            "status": job.status,
+            "progress": job.progress,
+            "status_url": status_url,
+            "poll_after_ms": 2000,
+        },
+    }
+
+
+def _build_task_status_payload(job: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "id": job.job_id,
+        "object": "generation.task",
+        "task_type": job.task_type,
+        "model": job.model,
+        "status": job.status,
+        "progress": job.progress,
+        "created_at": job.created_at.isoformat() if getattr(job, "created_at", None) else None,
+        "started_at": job.started_at.isoformat() if getattr(job, "started_at", None) else None,
+        "completed_at": job.completed_at.isoformat() if getattr(job, "completed_at", None) else None,
+    }
+    if job.error_message:
+        payload["error"] = {"message": job.error_message}
+    if job.response_payload is not None:
+        payload["result"] = job.response_payload
+    return payload
 
 
 def _parse_handler_result(result: str) -> Dict[str, Any]:
@@ -781,6 +856,19 @@ async def create_chat_completion(
                 },
             )
 
+        if MODEL_CONFIG.get(normalized.model, {}).get("type") == "image" and _should_enqueue_async(raw_request):
+            queue_service = _ensure_image_queue_service()
+            job = await queue_service.enqueue(
+                model=normalized.model,
+                prompt=normalized.prompt,
+                images=normalized.images,
+                base_url_override=request_base_url,
+            )
+            return JSONResponse(
+                status_code=202,
+                content=_build_async_task_payload(job, raw_request, normalized.model),
+            )
+
         payload = _enrich_payload_with_direct_url(
             _parse_handler_result(
                 await _collect_non_stream_result(
@@ -815,6 +903,19 @@ async def generate_content(
 
         request_base_url = _get_request_base_url(raw_request)
 
+        if MODEL_CONFIG.get(normalized.model, {}).get("type") == "image" and _should_enqueue_async(raw_request):
+            queue_service = _ensure_image_queue_service()
+            job = await queue_service.enqueue(
+                model=normalized.model,
+                prompt=normalized.prompt,
+                images=normalized.images,
+                base_url_override=request_base_url,
+            )
+            return JSONResponse(
+                status_code=202,
+                content=_build_async_task_payload(job, raw_request, normalized.model),
+            )
+
         payload = _enrich_payload_with_direct_url(
             _parse_handler_result(
                 await _collect_non_stream_result(
@@ -842,6 +943,23 @@ async def generate_content(
             status_code=500,
             content=_build_gemini_error_payload(500, str(exc)),
         )
+
+
+@router.get("/v1/tasks/{job_id}")
+@router.get("/tasks/{job_id}")
+async def get_generation_task_status(
+    job_id: str,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Return durable image queue task status and final payload when ready."""
+    queue_service = _ensure_image_queue_service()
+    job = await queue_service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Task not found: {job_id}")
+    return JSONResponse(
+        status_code=200,
+        content=_build_task_status_payload(job),
+    )
 
 
 @router.post("/v1beta/models/{model}:streamGenerateContent")

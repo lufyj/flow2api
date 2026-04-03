@@ -702,7 +702,7 @@ class GenerationHandler:
         """????????????????????"""
         if isinstance(generation_result, dict):
             generation_result["success"] = False
-            generation_result["error_message"] = error_message
+            generation_result["error_message"] = self._normalize_error_message(error_message)
             generation_result["error_emitted"] = True
 
     def _mark_generation_succeeded(self, generation_result: Optional[Dict[str, Any]]):
@@ -714,7 +714,18 @@ class GenerationHandler:
 
     def _normalize_error_message(self, error_message: Any, max_length: int = 1000) -> str:
         """归一化错误文本，避免写入超长内容。"""
-        text = str(error_message or "").strip() or "未知错误"
+        text = str(error_message or "").strip()
+        if not text and isinstance(error_message, BaseException):
+            text = type(error_message).__name__
+            args = [str(arg).strip() for arg in getattr(error_message, "args", ()) if str(arg).strip()]
+            if args:
+                text = f"{text}: {'; '.join(args)}"
+            else:
+                cause = getattr(error_message, "__cause__", None) or getattr(error_message, "__context__", None)
+                cause_text = str(cause or "").strip()
+                if cause_text:
+                    text = f"{text}: {cause_text}"
+        text = text or "未知错误"
         if len(text) <= max_length:
             return text
         return f"{text[:max_length - 3]}..."
@@ -1066,7 +1077,7 @@ class GenerationHandler:
             )
             raise
         except Exception as e:
-            error_msg = f"生成失败: {str(e)}"
+            error_msg = f"生成失败: {self._normalize_error_message(e)}"
             debug_logger.log_error(f"[GENERATION] ❌ {error_msg}")
             if token:
                 # 记录错误（所有错误统一处理，不再特殊处理429）
@@ -1955,9 +1966,11 @@ class GenerationHandler:
         """创建错误响应"""
         import json
 
+        normalized_error_message = self._normalize_error_message(error_message)
+
         error = {
             "error": {
-                "message": error_message,
+                "message": normalized_error_message,
                 "type": "server_error" if status_code >= 500 else "invalid_request_error",
                 "code": "generation_failed",
                 "status_code": status_code,

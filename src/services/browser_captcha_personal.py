@@ -4,6 +4,7 @@
 支持常驻模式：维护全局共享的常驻标签页池，即时生成 token
 """
 import asyncio
+from collections import deque
 import inspect
 import time
 import os
@@ -215,15 +216,24 @@ def _create_proxy_auth_extension(protocol: str, host: str, port: str, username: 
 
 class ResidentTabInfo:
     """常驻标签页信息结构"""
-    def __init__(self, tab, slot_id: str, project_id: Optional[str] = None):
+    def __init__(self, tab, slot_id: str, project_id: Optional[str] = None, token_id: Optional[int] = None):
         self.tab = tab
         self.slot_id = slot_id
         self.project_id = project_id or slot_id
+        self.token_id = int(token_id) if token_id else None
         self.recaptcha_ready = False
         self.created_at = time.time()
         self.last_used_at = time.time()  # 最后使用时间
         self.use_count = 0  # 使用次数
         self.solve_lock = asyncio.Lock()  # 串行化同一标签页上的执行，降低并发冲突
+        self.health_score = 0
+        self.upstream_success_count = 0
+        self.upstream_error_count = 0
+        self.last_token_at = 0.0
+        self.last_upstream_success_at = 0.0
+        self.cooldown_until = 0.0
+        self.recent_token_timestamps = deque()
+        self.recent_upstream_success_timestamps = deque()
 
 
 class BrowserCaptchaService:
@@ -234,7 +244,8 @@ class BrowserCaptchaService:
     2. 传统模式 (Legacy Mode): 每次请求创建新标签页 (fallback)
     """
 
-    _instance: Optional['BrowserCaptchaService'] = None
+    _instances: Dict[str, 'BrowserCaptchaService'] = {}
+    _project_pool_keys: Dict[str, str] = {}
     _lock = asyncio.Lock()
     _PROFILE_LANG_CANDIDATES = [
         "en-US",
@@ -242,488 +253,99 @@ class BrowserCaptchaService:
         "en-GB,en",
         "en-CA,en",
     ]
-    _PROFILE_TEMPLATE_CANDIDATES = [
+    _PROFILE_TIMEZONE_BY_LANG = {
+        "en-US": [
+            "America/New_York",
+            "America/Chicago",
+            "America/Denver",
+            "America/Los_Angeles",
+            "America/Phoenix",
+        ],
+        "en-GB": [
+            "Europe/London",
+        ],
+        "en-CA": [
+            "America/Toronto",
+            "America/Vancouver",
+            "America/Winnipeg",
+        ],
+    }
+    _PROFILE_COLOR_SCHEME_CANDIDATES = [
+        "light",
+        "light",
+        "dark",
+        "no-preference",
+    ]
+    _PROFILE_REDUCED_MOTION_CANDIDATES = [
+        "no-preference",
+        "no-preference",
+        "reduce",
+    ]
+    _PROFILE_COLOR_GAMUT_CANDIDATES = [
+        "srgb",
+        "srgb",
+        "p3",
+    ]
+    _PROFILE_GREASE_BRAND_VERSION_CANDIDATES = ["8", "24", "99"]
+    _PROFILE_BRAND_ORDER_CANDIDATES = [
+        ("Not.A/Brand", "Chromium", "Google Chrome"),
+        ("Chromium", "Not.A/Brand", "Google Chrome"),
+        ("Not.A/Brand", "Google Chrome", "Chromium"),
+    ]
+    _PROFILE_NETWORK_CANDIDATES = [
+        {"effective_type": "4g", "rtt": 50, "downlink": 9.5, "save_data": False},
+        {"effective_type": "4g", "rtt": 80, "downlink": 7.8, "save_data": False},
+        {"effective_type": "4g", "rtt": 120, "downlink": 5.2, "save_data": False},
+        {"effective_type": "3g", "rtt": 180, "downlink": 2.4, "save_data": False},
+    ]
+    _PROFILE_WEBGL_CANDIDATES = [
         {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "125"},
-                {"brand": "Google Chrome", "version": "125"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "125.0.0.0"},
-                {"brand": "Google Chrome", "version": "125.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
+            "vendor": "Google Inc. (Intel)",
+            "renderer": "ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
         },
         {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "126"},
-                {"brand": "Google Chrome", "version": "126"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "126.0.0.0"},
-                {"brand": "Google Chrome", "version": "126.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
+            "vendor": "Google Inc. (Intel)",
+            "renderer": "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
         },
         {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "127"},
-                {"brand": "Google Chrome", "version": "127"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "127.0.0.0"},
-                {"brand": "Google Chrome", "version": "127.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
+            "vendor": "Google Inc. (NVIDIA)",
+            "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
         },
         {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "128"},
-                {"brand": "Google Chrome", "version": "128"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "128.0.0.0"},
-                {"brand": "Google Chrome", "version": "128.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "129"},
-                {"brand": "Google Chrome", "version": "129"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "129.0.0.0"},
-                {"brand": "Google Chrome", "version": "129.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "130"},
-                {"brand": "Google Chrome", "version": "130"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "130.0.0.0"},
-                {"brand": "Google Chrome", "version": "130.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "131"},
-                {"brand": "Google Chrome", "version": "131"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "131.0.0.0"},
-                {"brand": "Google Chrome", "version": "131.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "132"},
-                {"brand": "Google Chrome", "version": "132"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "132.0.0.0"},
-                {"brand": "Google Chrome", "version": "132.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "133"},
-                {"brand": "Google Chrome", "version": "133"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "133.0.0.0"},
-                {"brand": "Google Chrome", "version": "133.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "134"},
-                {"brand": "Google Chrome", "version": "134"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "134.0.0.0"},
-                {"brand": "Google Chrome", "version": "134.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "135"},
-                {"brand": "Google Chrome", "version": "135"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "135.0.0.0"},
-                {"brand": "Google Chrome", "version": "135.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "136"},
-                {"brand": "Google Chrome", "version": "136"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "136.0.0.0"},
-                {"brand": "Google Chrome", "version": "136.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "137"},
-                {"brand": "Google Chrome", "version": "137"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "137.0.0.0"},
-                {"brand": "Google Chrome", "version": "137.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "138"},
-                {"brand": "Google Chrome", "version": "138"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "138.0.0.0"},
-                {"brand": "Google Chrome", "version": "138.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "139"},
-                {"brand": "Google Chrome", "version": "139"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "139.0.0.0"},
-                {"brand": "Google Chrome", "version": "139.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "140"},
-                {"brand": "Google Chrome", "version": "140"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "140.0.0.0"},
-                {"brand": "Google Chrome", "version": "140.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "141"},
-                {"brand": "Google Chrome", "version": "141"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "141.0.0.0"},
-                {"brand": "Google Chrome", "version": "141.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "142"},
-                {"brand": "Google Chrome", "version": "142"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "142.0.0.0"},
-                {"brand": "Google Chrome", "version": "142.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "143"},
-                {"brand": "Google Chrome", "version": "143"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "143.0.0.0"},
-                {"brand": "Google Chrome", "version": "143.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "144"},
-                {"brand": "Google Chrome", "version": "144"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "144.0.0.0"},
-                {"brand": "Google Chrome", "version": "144.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "145"},
-                {"brand": "Google Chrome", "version": "145"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "145.0.0.0"},
-                {"brand": "Google Chrome", "version": "145.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "146"},
-                {"brand": "Google Chrome", "version": "146"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "146.0.0.0"},
-                {"brand": "Google Chrome", "version": "146.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "147"},
-                {"brand": "Google Chrome", "version": "147"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "147.0.0.0"},
-                {"brand": "Google Chrome", "version": "147.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
-        },
-        {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-            "brands": [
-                {"brand": "Not.A/Brand", "version": "8"},
-                {"brand": "Chromium", "version": "148"},
-                {"brand": "Google Chrome", "version": "148"},
-            ],
-            "full_version_list": [
-                {"brand": "Not.A/Brand", "version": "8.0.0.0"},
-                {"brand": "Chromium", "version": "148.0.0.0"},
-                {"brand": "Google Chrome", "version": "148.0.0.0"},
-            ],
-            "platform": "Windows",
-            "platform_version": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
-            "model": "",
-            "mobile": False,
-            "wow64": False,
+            "vendor": "Google Inc. (AMD)",
+            "renderer": "ANGLE (AMD, AMD Radeon RX 6600 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
         },
     ]
+    _PROFILE_CHROME_MAJOR_CANDIDATES = tuple(range(120, 146))
+    _PROFILE_TEMPLATE_CANDIDATES = []
+    for _chrome_major in _PROFILE_CHROME_MAJOR_CANDIDATES:
+        _PROFILE_TEMPLATE_CANDIDATES.append(
+            {
+                "user_agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    f"Chrome/{_chrome_major}.0.0.0 Safari/537.36"
+                ),
+                "brands": [
+                    {"brand": "Not.A/Brand", "version": "8"},
+                    {"brand": "Chromium", "version": str(_chrome_major)},
+                    {"brand": "Google Chrome", "version": str(_chrome_major)},
+                ],
+                "full_version_list": [
+                    {"brand": "Not.A/Brand", "version": "8.0.0.0"},
+                    {"brand": "Chromium", "version": f"{_chrome_major}.0.0.0"},
+                    {"brand": "Google Chrome", "version": f"{_chrome_major}.0.0.0"},
+                ],
+                "platform": "Windows",
+                "platform_version": "10.0.0",
+                "architecture": "x86",
+                "bitness": "64",
+                "model": "",
+                "mobile": False,
+                "wow64": False,
+            }
+        )
+    del _chrome_major
     _PROFILE_VIEWPORT_CANDIDATES = [
         (1280, 720),
         (1366, 768),
@@ -733,13 +355,15 @@ class BrowserCaptchaService:
         (1728, 972),
     ]
 
-    def __init__(self, db=None):
+    def __init__(self, db=None, proxy_url_override: Optional[str] = None, pool_key: Optional[str] = None):
         """初始化服务"""
         self.headless = False  # nodriver 有头模式
         self.browser = None
         self._initialized = False
         self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
         self.db = db
+        self._proxy_url_override = (proxy_url_override or "").strip() or None
+        self._pool_key = pool_key or (self._proxy_url_override or "__default__")
         # 使用 None 让 nodriver 自动创建临时目录，避免目录锁定问题
         self.user_data_dir = None
         self._fingerprint_profile = self._build_fingerprint_profile()
@@ -753,13 +377,68 @@ class BrowserCaptchaService:
         self._resident_lock = asyncio.Lock()  # 保护常驻标签页操作
         self._browser_lock = asyncio.Lock()  # 保护浏览器初始化/关闭/重启，避免重复拉起实例
         self._tab_build_lock = asyncio.Lock()  # 串行化冷启动/重建，降低 nodriver 抖动
+        self._tab_build_semaphore = asyncio.Semaphore(
+            int(max(1, getattr(config, "personal_tab_build_concurrency", 3) or 3))
+        )
         self._legacy_lock = asyncio.Lock()  # 避免 legacy fallback 并发失控创建临时标签页
         self._max_resident_tabs = int(max(1, getattr(config, "personal_max_resident_tabs", 5) or 5))  # 最大常驻标签页数量（支持并发）
         self._idle_tab_ttl_seconds = int(max(60, getattr(config, "personal_idle_tab_ttl_seconds", 600) or 600))  # 标签页空闲超时(秒)
         self._idle_reaper_task: Optional[asyncio.Task] = None  # 空闲回收任务
-        self._resident_max_use_count = int(max(1, getattr(config, "personal_resident_max_use_count", 2) or 2))
+        self._resident_max_use_count = int(max(1, getattr(config, "personal_resident_max_use_count", 3) or 3))
         self._resident_fingerprint_cooldown_seconds = float(
-            max(0.0, getattr(config, "personal_resident_fingerprint_cooldown_seconds", 20.0) or 20.0)
+            max(0.0, getattr(config, "personal_resident_fingerprint_cooldown_seconds", 5.0) or 5.0)
+        )
+        self._resident_runtime_expand_enabled = bool(
+            getattr(config, "personal_resident_runtime_expand_enabled", False)
+        )
+        self._pool_restart_unhealthy_ratio_threshold = float(
+            min(
+                1.0,
+                max(
+                    0.1,
+                    getattr(config, "personal_pool_restart_unhealthy_ratio_threshold", 0.7) or 0.7,
+                ),
+            )
+        )
+        self._pool_restart_min_unhealthy_slots = int(
+            max(2, getattr(config, "personal_pool_restart_min_unhealthy_slots", 4) or 4)
+        )
+        self._pool_restart_cooldown_seconds = float(
+            max(5.0, getattr(config, "personal_pool_restart_cooldown_seconds", 45.0) or 45.0)
+        )
+        self._pool_restart_cooldown_until = 0.0
+        self._resident_unhealthy_health_threshold = int(
+            min(-1, getattr(config, "personal_resident_unhealthy_health_threshold", -6) or -6)
+        )
+        self._resident_rebuild_health_threshold = int(
+            min(
+                self._resident_unhealthy_health_threshold,
+                getattr(config, "personal_resident_rebuild_health_threshold", -12) or -12,
+            )
+        )
+        self._slot_wait_timeout_seconds = float(
+            max(1.0, getattr(config, "personal_slot_wait_timeout_seconds", 12.0) or 12.0)
+        )
+        self._flow_recover_threshold = int(
+            max(1, getattr(config, "browser_personal_recover_threshold", 2) or 2)
+        )
+        self._fingerprint_window_seconds = float(
+            max(1.0, getattr(config, "personal_fingerprint_window_seconds", 30.0) or 30.0)
+        )
+        self._fingerprint_max_uses_per_window = int(
+            max(1, getattr(config, "personal_fingerprint_max_uses_per_window", 2) or 2)
+        )
+        self._fingerprint_rate_limit_cooldown_seconds = float(
+            max(0.0, getattr(config, "personal_fingerprint_rate_limit_cooldown_seconds", 15.0) or 15.0)
+        )
+        self._standby_target_count = int(
+            max(0, getattr(config, "personal_resident_standby_count", 0) or 0)
+        )
+        self._queue_limit = int(
+            max(1, getattr(config, "personal_queue_limit", 20) or 20)
+        )
+        self._queue_acquire_timeout_seconds = float(
+            max(1.0, getattr(config, "personal_queue_acquire_timeout_seconds", 10.0) or 10.0)
         )
         self._command_timeout_seconds = 8.0
         self._navigation_timeout_seconds = 20.0
@@ -776,22 +455,73 @@ class BrowserCaptchaService:
         self._project_flow_error_streaks: dict[str, int] = {}
         self._proxy_url: Optional[str] = None
         self._proxy_ext_dir: Optional[str] = None
+        self._browser_ready_event = asyncio.Event()
+        self._queue_semaphore = asyncio.Semaphore(self._queue_limit)
+        self._standby_fill_task: Optional[asyncio.Task] = None
         # 自定义站点打码常驻页（用于 score-test）
         self._custom_tabs: dict[str, Dict[str, Any]] = {}
         self._custom_lock = asyncio.Lock()
 
     @classmethod
     async def get_instance(cls, db=None) -> 'BrowserCaptchaService':
-        """获取单例实例"""
-        if cls._instance is None:
-            async with cls._lock:
-                if cls._instance is None:
-                    cls._instance = cls(db)
-                    # 启动空闲标签页回收任务
-                    cls._instance._idle_reaper_task = asyncio.create_task(
-                        cls._instance._idle_tab_reaper_loop()
-                    )
-        return cls._instance
+        return await cls.get_pool_instance(db=db, proxy_url=None)
+
+    @classmethod
+    async def get_pool_instance(
+        cls,
+        db=None,
+        proxy_url: Optional[str] = None,
+    ) -> 'BrowserCaptchaService':
+        normalized_proxy_url = (proxy_url or "").strip() or None
+        pool_key = normalized_proxy_url or "__default__"
+        instance = cls._instances.get(pool_key)
+        if instance is not None:
+            if db is not None:
+                instance.db = db
+            return instance
+
+        async with cls._lock:
+            instance = cls._instances.get(pool_key)
+            if instance is None:
+                instance = cls(db, proxy_url_override=normalized_proxy_url, pool_key=pool_key)
+                instance._idle_reaper_task = asyncio.create_task(instance._idle_tab_reaper_loop())
+                cls._instances[pool_key] = instance
+            elif db is not None:
+                instance.db = db
+            return instance
+
+    @classmethod
+    async def get_instance_for_token(
+        cls,
+        db=None,
+        token_id: Optional[int] = None,
+    ) -> 'BrowserCaptchaService':
+        proxy_url = None
+        if db is not None and token_id:
+            try:
+                token = await db.get_token(token_id)
+                if token and getattr(token, "captcha_proxy_url", None):
+                    proxy_url = str(token.captcha_proxy_url or "").strip() or None
+            except Exception as e:
+                debug_logger.log_warning(f"[BrowserCaptcha] 读取 token({token_id}) 打码代理失败: {e}")
+        return await cls.get_pool_instance(db=db, proxy_url=proxy_url)
+
+    @classmethod
+    async def get_instance_for_project(
+        cls,
+        db=None,
+        project_id: Optional[str] = None,
+    ) -> 'BrowserCaptchaService':
+        normalized_project_id = str(project_id or "").strip()
+        if normalized_project_id:
+            pool_key = cls._project_pool_keys.get(normalized_project_id)
+            if pool_key:
+                instance = cls._instances.get(pool_key)
+                if instance is not None:
+                    if db is not None:
+                        instance.db = db
+                    return instance
+        return await cls.get_instance(db=db)
 
     @classmethod
     def _build_fingerprint_profile(
@@ -818,17 +548,70 @@ class BrowserCaptchaService:
         window_y = 80 + rng.randint(0, 220)
         lang = rng.choice(cls._PROFILE_LANG_CANDIDATES)
         language_items = [part.strip() for part in lang.split(",") if part.strip()]
+        lang_primary = language_items[0] if language_items else "en-US"
+        timezone_candidates = cls._PROFILE_TIMEZONE_BY_LANG.get(lang_primary, ["UTC"])
+        timezone = rng.choice(timezone_candidates)
         dpr = rng.choice([1, 1.25, 1.5, 2])
         hardware_concurrency = rng.choice([4, 8, 12, 16])
         device_memory = rng.choice([4, 8, 16])
         max_touch_points = rng.choice([0, 0, 0, 1])
         color_depth = rng.choice([24, 30])
+        prefers_color_scheme = rng.choice(cls._PROFILE_COLOR_SCHEME_CANDIDATES)
+        prefers_reduced_motion = rng.choice(cls._PROFILE_REDUCED_MOTION_CANDIDATES)
+        color_gamut = rng.choice(cls._PROFILE_COLOR_GAMUT_CANDIDATES)
+        network_profile = dict(rng.choice(cls._PROFILE_NETWORK_CANDIDATES))
+        webgl_profile = dict(rng.choice(cls._PROFILE_WEBGL_CANDIDATES))
         screen_width = width + rng.choice([0, 64, 80, 96, 128])
         screen_height = height + rng.choice([72, 80, 96, 120, 144])
+        navigator_platform = "Win32" if template.get("platform", "Windows") == "Windows" else str(template.get("platform") or "")
+        chrome_major = ""
+        for brand_item in template.get("brands") or []:
+            brand_name = str((brand_item or {}).get("brand") or "").strip()
+            if brand_name == "Google Chrome":
+                chrome_major = str((brand_item or {}).get("version") or "").strip()
+                break
+        if not chrome_major:
+            user_agent_value = str(template.get("user_agent") or "")
+            user_agent_match = re.search(r"Chrome/([0-9]+)\.0\.0\.0", user_agent_value)
+            if user_agent_match:
+                chrome_major = user_agent_match.group(1)
+        chrome_major = chrome_major or "126"
+        grease_brand_version = rng.choice(cls._PROFILE_GREASE_BRAND_VERSION_CANDIDATES)
+        brand_entries = {
+            "Not.A/Brand": {
+                "brand": "Not.A/Brand",
+                "version": grease_brand_version,
+            },
+            "Chromium": {
+                "brand": "Chromium",
+                "version": chrome_major,
+            },
+            "Google Chrome": {
+                "brand": "Google Chrome",
+                "version": chrome_major,
+            },
+        }
+        full_version_entries = {
+            "Not.A/Brand": {
+                "brand": "Not.A/Brand",
+                "version": f"{grease_brand_version}.0.0.0",
+            },
+            "Chromium": {
+                "brand": "Chromium",
+                "version": f"{chrome_major}.0.0.0",
+            },
+            "Google Chrome": {
+                "brand": "Google Chrome",
+                "version": f"{chrome_major}.0.0.0",
+            },
+        }
+        brand_order = rng.choice(cls._PROFILE_BRAND_ORDER_CANDIDATES)
+        brands = [dict(brand_entries[name]) for name in brand_order]
+        full_version_list = [dict(full_version_entries[name]) for name in brand_order]
         return {
             "user_agent": template.get("user_agent", ""),
-            "brands": template.get("brands", []),
-            "full_version_list": template.get("full_version_list", []),
+            "brands": brands,
+            "full_version_list": full_version_list,
             "platform": template.get("platform", "Windows"),
             "platform_version": template.get("platform_version", "10.0.0"),
             "architecture": template.get("architecture", "x86"),
@@ -838,6 +621,8 @@ class BrowserCaptchaService:
             "wow64": bool(template.get("wow64", False)),
             "lang": lang,
             "languages": language_items or ["en-US"],
+            "timezone": timezone,
+            "navigator_platform": navigator_platform,
             "viewport": {"width": width, "height": height},
             "window_position": {"x": window_x, "y": window_y},
             "device_pixel_ratio": dpr,
@@ -846,6 +631,12 @@ class BrowserCaptchaService:
             "max_touch_points": max_touch_points,
             "color_depth": color_depth,
             "pixel_depth": color_depth,
+            "prefers_color_scheme": prefers_color_scheme,
+            "prefers_reduced_motion": prefers_reduced_motion,
+            "color_gamut": color_gamut,
+            "network": network_profile,
+            "webgl_vendor": webgl_profile.get("vendor", ""),
+            "webgl_renderer": webgl_profile.get("renderer", ""),
             "screen": {
                 "width": screen_width,
                 "height": screen_height,
@@ -972,16 +763,26 @@ class BrowserCaptchaService:
             "fullVersionList": profile.get("full_version_list") or [],
             "platform": str(profile.get("platform") or "Windows"),
             "platformVersion": str(profile.get("platform_version") or "10.0.0"),
+            "navigatorPlatform": str(profile.get("navigator_platform") or "Win32"),
             "architecture": str(profile.get("architecture") or "x86"),
             "bitness": str(profile.get("bitness") or "64"),
             "model": str(profile.get("model") or ""),
             "mobile": bool(profile.get("mobile", False)),
             "wow64": bool(profile.get("wow64", False)),
+            "timezone": str(profile.get("timezone") or "UTC"),
+            "prefersColorScheme": str(profile.get("prefers_color_scheme") or "light"),
+            "prefersReducedMotion": str(profile.get("prefers_reduced_motion") or "no-preference"),
+            "colorGamut": str(profile.get("color_gamut") or "srgb"),
+            "network": profile.get("network") or {},
+            "webglVendor": str(profile.get("webgl_vendor") or ""),
+            "webglRenderer": str(profile.get("webgl_renderer") or ""),
         }
         payload_json = json.dumps(payload, ensure_ascii=False)
         return f"""
             (() => {{
                 const profile = {payload_json};
+                const originalResolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
+                const originalMatchMedia = window.matchMedia ? window.matchMedia.bind(window) : null;
                 const defineGetter = (target, key, value) => {{
                     if (!target) return;
                     try {{
@@ -995,14 +796,28 @@ class BrowserCaptchaService:
                 defineGetter(Navigator.prototype, 'webdriver', undefined);
                 defineGetter(Navigator.prototype, 'userAgent', profile.userAgent);
                 defineGetter(Navigator.prototype, 'appVersion', profile.userAgent.replace(/^Mozilla\\//, ''));
-                defineGetter(Navigator.prototype, 'platform', profile.platform === 'Windows' ? 'Win32' : profile.platform);
+                defineGetter(Navigator.prototype, 'platform', profile.navigatorPlatform || profile.platform);
                 defineGetter(Navigator.prototype, 'vendor', 'Google Inc.');
+                defineGetter(Navigator.prototype, 'vendorSub', '');
+                defineGetter(Navigator.prototype, 'productSub', '20030107');
+                defineGetter(Navigator.prototype, 'pdfViewerEnabled', true);
                 defineGetter(Navigator.prototype, 'language', profile.language);
                 defineGetter(Navigator.prototype, 'languages', profile.languages);
                 defineGetter(Navigator.prototype, 'hardwareConcurrency', profile.hardwareConcurrency);
                 defineGetter(Navigator.prototype, 'deviceMemory', profile.deviceMemory);
                 defineGetter(Navigator.prototype, 'maxTouchPoints', profile.maxTouchPoints);
                 defineGetter(window, 'devicePixelRatio', profile.devicePixelRatio);
+
+                try {{
+                    Intl.DateTimeFormat.prototype.resolvedOptions = function(...args) {{
+                        const result = originalResolvedOptions.apply(this, args);
+                        result.timeZone = profile.timezone;
+                        if (!result.locale && profile.language) {{
+                            result.locale = profile.language;
+                        }}
+                        return result;
+                    }};
+                }} catch (e) {{}}
 
                 const uaData = {{
                     brands: profile.brands,
@@ -1027,6 +842,46 @@ class BrowserCaptchaService:
                 }};
                 defineGetter(Navigator.prototype, 'userAgentData', uaData);
 
+                const mediaMatches = {{
+                    '(prefers-color-scheme: dark)': profile.prefersColorScheme === 'dark',
+                    '(prefers-color-scheme: light)': profile.prefersColorScheme === 'light',
+                    '(prefers-reduced-motion: reduce)': profile.prefersReducedMotion === 'reduce',
+                    '(prefers-reduced-motion: no-preference)': profile.prefersReducedMotion !== 'reduce',
+                    '(color-gamut: p3)': profile.colorGamut === 'p3',
+                    '(color-gamut: srgb)': profile.colorGamut !== 'p3'
+                }};
+                if (originalMatchMedia) {{
+                    window.matchMedia = (query) => {{
+                        const normalized = String(query || '').trim();
+                        if (Object.prototype.hasOwnProperty.call(mediaMatches, normalized)) {{
+                            return {{
+                                matches: !!mediaMatches[normalized],
+                                media: normalized,
+                                onchange: null,
+                                addListener: () => {{}},
+                                removeListener: () => {{}},
+                                addEventListener: () => {{}},
+                                removeEventListener: () => {{}},
+                                dispatchEvent: () => false
+                            }};
+                        }}
+                        return originalMatchMedia(normalized);
+                    }};
+                }}
+
+                if (Navigator.prototype && 'connection' in Navigator.prototype) {{
+                    const connectionValue = {{
+                        effectiveType: profile.network.effective_type || '4g',
+                        rtt: Number(profile.network.rtt || 80),
+                        downlink: Number(profile.network.downlink || 6.5),
+                        saveData: !!profile.network.save_data,
+                        addEventListener: () => {{}},
+                        removeEventListener: () => {{}},
+                        dispatchEvent: () => false
+                    }};
+                    defineGetter(Navigator.prototype, 'connection', connectionValue);
+                }}
+
                 if (window.screen) {{
                     defineGetter(window.screen, 'width', profile.screen.width);
                     defineGetter(window.screen, 'height', profile.screen.height);
@@ -1035,6 +890,30 @@ class BrowserCaptchaService:
                     defineGetter(window.screen, 'colorDepth', profile.colorDepth);
                     defineGetter(window.screen, 'pixelDepth', profile.pixelDepth);
                 }}
+
+                const patchWebGL = (proto) => {{
+                    if (!proto || typeof proto.getParameter !== 'function') return;
+                    const originalGetParameter = proto.getParameter;
+                    proto.getParameter = function(parameter) {{
+                        if (parameter === 37445 && profile.webglVendor) return profile.webglVendor;
+                        if (parameter === 37446 && profile.webglRenderer) return profile.webglRenderer;
+                        return originalGetParameter.apply(this, arguments);
+                    }};
+                    if (typeof proto.getExtension === 'function') {{
+                        const originalGetExtension = proto.getExtension;
+                        proto.getExtension = function(name) {{
+                            if (name === 'WEBGL_debug_renderer_info') {{
+                                return {{
+                                    UNMASKED_VENDOR_WEBGL: 37445,
+                                    UNMASKED_RENDERER_WEBGL: 37446
+                                }};
+                            }}
+                            return originalGetExtension.apply(this, arguments);
+                        }};
+                    }}
+                }};
+                patchWebGL(window.WebGLRenderingContext && window.WebGLRenderingContext.prototype);
+                patchWebGL(window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype);
             }})()
         """
 
@@ -1159,6 +1038,11 @@ class BrowserCaptchaService:
         old_idle_ttl = self._idle_tab_ttl_seconds
         old_max_use_count = self._resident_max_use_count
         old_fingerprint_cooldown = self._resident_fingerprint_cooldown_seconds
+        old_unhealthy_threshold = self._resident_unhealthy_health_threshold
+        old_rebuild_health_threshold = self._resident_rebuild_health_threshold
+        old_slot_wait_timeout = self._slot_wait_timeout_seconds
+        old_window_seconds = self._fingerprint_window_seconds
+        old_window_max_uses = self._fingerprint_max_uses_per_window
 
         self._max_resident_tabs = config.personal_max_resident_tabs
         self._idle_tab_ttl_seconds = config.personal_idle_tab_ttl_seconds
@@ -1172,13 +1056,84 @@ class BrowserCaptchaService:
                 or old_fingerprint_cooldown,
             )
         )
+        self._resident_runtime_expand_enabled = bool(
+            getattr(config, "personal_resident_runtime_expand_enabled", self._resident_runtime_expand_enabled)
+        )
+        self._pool_restart_unhealthy_ratio_threshold = float(
+            min(
+                1.0,
+                max(
+                    0.1,
+                    getattr(
+                        config,
+                        "personal_pool_restart_unhealthy_ratio_threshold",
+                        self._pool_restart_unhealthy_ratio_threshold,
+                    )
+                    or self._pool_restart_unhealthy_ratio_threshold,
+                ),
+            )
+        )
+        self._pool_restart_min_unhealthy_slots = int(
+            max(
+                2,
+                getattr(
+                    config,
+                    "personal_pool_restart_min_unhealthy_slots",
+                    self._pool_restart_min_unhealthy_slots,
+                )
+                or self._pool_restart_min_unhealthy_slots,
+            )
+        )
+        self._pool_restart_cooldown_seconds = float(
+            max(
+                5.0,
+                getattr(
+                    config,
+                    "personal_pool_restart_cooldown_seconds",
+                    self._pool_restart_cooldown_seconds,
+                )
+                or self._pool_restart_cooldown_seconds,
+            )
+        )
+        self._resident_unhealthy_health_threshold = int(
+            min(
+                -1,
+                getattr(config, "personal_resident_unhealthy_health_threshold", old_unhealthy_threshold)
+                or old_unhealthy_threshold,
+            )
+        )
+        self._resident_rebuild_health_threshold = int(
+            min(
+                self._resident_unhealthy_health_threshold,
+                getattr(config, "personal_resident_rebuild_health_threshold", old_rebuild_health_threshold)
+                or old_rebuild_health_threshold,
+            )
+        )
+        self._slot_wait_timeout_seconds = float(
+            max(1.0, getattr(config, "personal_slot_wait_timeout_seconds", old_slot_wait_timeout) or old_slot_wait_timeout)
+        )
+        self._fingerprint_window_seconds = float(
+            max(1.0, getattr(config, "personal_fingerprint_window_seconds", old_window_seconds) or old_window_seconds)
+        )
+        self._fingerprint_max_uses_per_window = int(
+            max(1, getattr(config, "personal_fingerprint_max_uses_per_window", old_window_max_uses) or old_window_max_uses)
+        )
 
         debug_logger.log_info(
             f"[BrowserCaptcha] Personal 配置已热更新: "
             f"max_tabs {old_max_tabs}->{self._max_resident_tabs}, "
             f"idle_ttl {old_idle_ttl}s->{self._idle_tab_ttl_seconds}s, "
             f"max_use_count {old_max_use_count}->{self._resident_max_use_count}, "
-            f"fingerprint_cooldown {old_fingerprint_cooldown}s->{self._resident_fingerprint_cooldown_seconds}s"
+            f"fingerprint_cooldown {old_fingerprint_cooldown}s->{self._resident_fingerprint_cooldown_seconds}s, "
+            f"runtime_expand {self._resident_runtime_expand_enabled}, "
+            f"pool_restart_ratio {self._pool_restart_unhealthy_ratio_threshold}, "
+            f"pool_restart_min_unhealthy {self._pool_restart_min_unhealthy_slots}, "
+            f"pool_restart_cooldown {self._pool_restart_cooldown_seconds}s, "
+            f"unhealthy_threshold {old_unhealthy_threshold}->{self._resident_unhealthy_health_threshold}, "
+            f"rebuild_health_threshold {old_rebuild_health_threshold}->{self._resident_rebuild_health_threshold}, "
+            f"slot_wait_timeout {old_slot_wait_timeout}s->{self._slot_wait_timeout_seconds}s, "
+            f"window_seconds {old_window_seconds}s->{self._fingerprint_window_seconds}s, "
+            f"window_max_uses {old_window_max_uses}->{self._fingerprint_max_uses_per_window}"
         )
 
     def _check_available(self):
@@ -1222,11 +1177,33 @@ class BrowserCaptchaService:
         )
 
     async def _browser_get(self, url: str, label: str, new_tab: bool = False, timeout_seconds: Optional[float] = None):
-        return await self._run_with_timeout(
-            self.browser.get(url, new_tab=new_tab),
-            timeout_seconds or self._navigation_timeout_seconds,
-            label,
-        )
+        await self._await_browser_ready(timeout_seconds=max(5.0, timeout_seconds or self._navigation_timeout_seconds))
+        try:
+            return await self._run_with_timeout(
+                self.browser.get(url, new_tab=new_tab),
+                timeout_seconds or self._navigation_timeout_seconds,
+                label,
+            )
+        except Exception as e:
+            if not self._is_no_browser_open_error(e):
+                raise
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] browser.get failed with browser-down error, recover and retry once: "
+                f"pool={self._pool_key}, label={label}, new_tab={new_tab}, error={e}"
+            )
+            recovered = await self._recover_browser_runtime_after_tab_failure(
+                reason=str(e),
+                project_id=None,
+                token_id=None,
+            )
+            if not recovered:
+                raise
+            await self._await_browser_ready(timeout_seconds=max(5.0, timeout_seconds or self._navigation_timeout_seconds))
+            return await self._run_with_timeout(
+                self.browser.get(url, new_tab=new_tab),
+                timeout_seconds or self._navigation_timeout_seconds,
+                f"{label}:after_recover",
+            )
 
     async def _tab_reload(self, tab, label: str, timeout_seconds: Optional[float] = None):
         return await self._run_with_timeout(
@@ -1236,6 +1213,7 @@ class BrowserCaptchaService:
         )
 
     async def _get_browser_cookies(self, label: str, timeout_seconds: Optional[float] = None):
+        await self._await_browser_ready(timeout_seconds=max(5.0, timeout_seconds or self._command_timeout_seconds))
         return await self._run_with_timeout(
             self.browser.cookies.get_all(),
             timeout_seconds or self._command_timeout_seconds,
@@ -1249,10 +1227,128 @@ class BrowserCaptchaService:
         label: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
     ):
+        await self._await_browser_ready(timeout_seconds=max(5.0, timeout_seconds or self._command_timeout_seconds))
         return await self._run_with_timeout(
             self.browser.connection.send(method, params) if params else self.browser.connection.send(method),
             timeout_seconds or self._command_timeout_seconds,
             label or method,
+        )
+
+    async def _await_browser_ready(self, timeout_seconds: float = 10.0):
+        effective_timeout = max(1.0, float(timeout_seconds or 10.0))
+        if not self._browser_ready_event.is_set():
+            await asyncio.wait_for(self._browser_ready_event.wait(), timeout=effective_timeout)
+        if not self.browser or not self._initialized:
+            raise RuntimeError("browser not initialized")
+        try:
+            if self.browser.stopped:
+                raise RuntimeError("browser stopped")
+        except Exception as e:
+            raise RuntimeError(f"browser unavailable: {e}") from e
+
+    def _is_no_browser_open_error(self, error: Exception) -> bool:
+        message = str(error or "").lower()
+        return "no browser is open" in message or "browser unavailable" in message
+
+    def _is_recaptcha_not_ready_error(self, error: Optional[str]) -> bool:
+        message = str(error or "").lower()
+        return (
+            "grecaptcha is not defined" in message
+            or "grecaptcha is undefined" in message
+            or "cannot read properties of undefined" in message
+            or "execute is not a function" in message
+            or "ready is not a function" in message
+        )
+
+    async def _recover_browser_runtime_after_tab_failure(
+        self,
+        *,
+        reason: str,
+        project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
+    ) -> bool:
+        debug_logger.log_warning(
+            f"[BrowserCaptcha] browser runtime recovery start: pool={self._pool_key}, "
+            f"project={project_id}, token_id={token_id}, reason={reason}"
+        )
+        try:
+            async with self._browser_lock:
+                await self._shutdown_browser_runtime_locked(reason=f"tab_failure:{reason}")
+            await self.initialize()
+            debug_logger.log_info(
+                f"[BrowserCaptcha] browser runtime recovery success: pool={self._pool_key}, "
+                f"project={project_id}, token_id={token_id}"
+            )
+            return True
+        except Exception as e:
+            debug_logger.log_error(
+                f"[BrowserCaptcha] browser runtime recovery failed: pool={self._pool_key}, "
+                f"project={project_id}, token_id={token_id}, error={e}"
+            )
+            return False
+
+    async def _probe_browser_ready_after_start(self, browser_instance, timeout_seconds: float = 10.0):
+        deadline = time.time() + max(1.0, float(timeout_seconds or 10.0))
+        last_error: Optional[Exception] = None
+
+        while time.time() < deadline:
+            if browser_instance is not self.browser:
+                raise RuntimeError("browser instance replaced during startup")
+            try:
+                if getattr(browser_instance, "stopped", False):
+                    raise RuntimeError("browser stopped during startup")
+                connection = getattr(browser_instance, "connection", None)
+                if connection is None:
+                    raise RuntimeError("browser connection missing during startup")
+                try:
+                    tabs = list(getattr(browser_instance, "tabs", []) or [])
+                except TypeError:
+                    tabs = []
+                if tabs:
+                    await asyncio.sleep(0.2)
+                    return
+                # 某些 nodriver/Chrome 组合下，浏览器已可用但 tabs 列表会稍后才填充。
+                # 这里不要把“没有 seed tab”当成启动失败，否则会直接导致整池拿不到 token。
+                await asyncio.sleep(0.35)
+                return
+            except Exception as e:
+                last_error = e
+            await asyncio.sleep(0.25)
+
+        raise RuntimeError(
+            "browser ready probe timed out"
+            + (f": {last_error}" if last_error else " (no seed tab)")
+        )
+
+    async def _probe_browser_ready_after_start(self, browser_instance, timeout_seconds: float = 10.0):
+        deadline = time.time() + max(1.0, float(timeout_seconds or 10.0))
+        last_error: Optional[Exception] = None
+
+        while time.time() < deadline:
+            if browser_instance is not self.browser:
+                raise RuntimeError("browser instance replaced during startup")
+            try:
+                if getattr(browser_instance, "stopped", False):
+                    raise RuntimeError("browser stopped during startup")
+                connection = getattr(browser_instance, "connection", None)
+                if connection is None:
+                    raise RuntimeError("browser connection missing during startup")
+                try:
+                    tabs = list(getattr(browser_instance, "tabs", []) or [])
+                except TypeError:
+                    tabs = []
+                if tabs:
+                    await asyncio.sleep(0.2)
+                    return
+                await asyncio.sleep(0.35)
+                return
+            except Exception as e:
+                last_error = e
+            await asyncio.sleep(0.25)
+
+        raise RuntimeError(
+            "browser ready probe timed out"
+            + (f": {last_error}" if last_error else " (no seed tab)")
         )
 
     async def _idle_tab_reaper_loop(self):
@@ -1345,6 +1441,9 @@ class BrowserCaptchaService:
         ]
         for project_id in stale_projects:
             self._project_resident_affinity.pop(project_id, None)
+            mapped_pool_key = self.__class__._project_pool_keys.get(project_id)
+            if mapped_pool_key == self._pool_key:
+                self.__class__._project_pool_keys.pop(project_id, None)
 
     def _resolve_affinity_slot_locked(self, project_id: Optional[str]) -> Optional[str]:
         normalized_project_id = str(project_id or "").strip()
@@ -1357,12 +1456,57 @@ class BrowserCaptchaService:
             self._project_resident_affinity.pop(normalized_project_id, None)
         return None
 
+    def _assign_slot_to_token_locked(
+        self,
+        resident_info: Optional[ResidentTabInfo],
+        token_id: Optional[int],
+    ) -> None:
+        if resident_info is None or not token_id:
+            return
+        resident_info.token_id = int(token_id)
+
+    def _get_token_scoped_candidates_locked(
+        self,
+        token_id: Optional[int],
+    ) -> list[tuple[str, ResidentTabInfo]]:
+        candidates = [
+            (slot_id, resident_info)
+            for slot_id, resident_info in self._resident_tabs.items()
+            if resident_info and resident_info.tab
+        ]
+        if not token_id:
+            return candidates
+
+        owned_candidates = [
+            (slot_id, resident_info)
+            for slot_id, resident_info in candidates
+            if resident_info.token_id == token_id
+        ]
+        if owned_candidates:
+            return owned_candidates
+
+        unassigned_candidates = [
+            (slot_id, resident_info)
+            for slot_id, resident_info in candidates
+            if resident_info.token_id is None
+        ]
+        if unassigned_candidates:
+            return unassigned_candidates
+
+        return []
+
+    def _count_token_slots_locked(self, token_id: Optional[int]) -> int:
+        if not token_id:
+            return len(self._resident_tabs)
+        return sum(1 for resident_info in self._resident_tabs.values() if resident_info and resident_info.token_id == token_id)
+
     def _remember_project_affinity(self, project_id: Optional[str], slot_id: Optional[str], resident_info: Optional[ResidentTabInfo]):
         normalized_project_id = str(project_id or "").strip()
         if not normalized_project_id or not slot_id or resident_info is None:
             return
         self._project_resident_affinity[normalized_project_id] = slot_id
         resident_info.project_id = normalized_project_id
+        self.__class__._project_pool_keys[normalized_project_id] = self._pool_key
 
     def _is_resident_slot_rotation_due(
         self,
@@ -1372,15 +1516,175 @@ class BrowserCaptchaService:
             return False
         return resident_info.use_count >= self._resident_max_use_count
 
+    def _is_resident_slot_selection_blocked(
+        self,
+        slot_id: Optional[str],
+        resident_info: Optional[ResidentTabInfo],
+    ) -> bool:
+        if resident_info is None:
+            return False
+        if self._is_resident_slot_rotation_due(resident_info):
+            return True
+        if resident_info.health_score <= self._resident_unhealthy_health_threshold:
+            return True
+        if slot_id and self._resident_error_streaks.get(slot_id, 0) >= self._flow_recover_threshold:
+            return True
+        return False
+
+    def _should_rebuild_resident_slot(
+        self,
+        slot_id: Optional[str],
+        resident_info: Optional[ResidentTabInfo],
+    ) -> bool:
+        if resident_info is None:
+            return False
+        if self._is_resident_slot_rotation_due(resident_info):
+            return True
+        if resident_info.health_score <= self._resident_rebuild_health_threshold:
+            return True
+        if slot_id and self._resident_error_streaks.get(slot_id, 0) >= self._flow_recover_threshold:
+            return True
+        return False
+
+    def _can_create_runtime_resident_tab(self) -> bool:
+        if self._resident_runtime_expand_enabled:
+            return True
+        return len(self._resident_tabs) == 0
+
+    def _should_restart_pool_locked(self, snapshot: Optional[Dict[str, int]]) -> bool:
+        if not snapshot:
+            return False
+        total = int(snapshot.get("total", 0) or 0)
+        unhealthy = int(snapshot.get("unhealthy", 0) or 0)
+        if total < self._pool_restart_min_unhealthy_slots:
+            return False
+        if unhealthy < self._pool_restart_min_unhealthy_slots:
+            return False
+        if (unhealthy / max(1, total)) < self._pool_restart_unhealthy_ratio_threshold:
+            return False
+        if time.time() < self._pool_restart_cooldown_until:
+            return False
+        return True
+
+    def _pick_forced_rebuild_candidate_locked(
+        self,
+        token_id: Optional[int],
+    ) -> tuple[Optional[str], Optional[ResidentTabInfo]]:
+        candidates = self._get_token_scoped_candidates_locked(token_id)
+        blocked_candidates = [
+            (slot_id, resident_info)
+            for slot_id, resident_info in candidates
+            if self._is_resident_slot_selection_blocked(slot_id, resident_info)
+        ]
+        if not blocked_candidates:
+            blocked_candidates = [
+                (slot_id, resident_info)
+                for slot_id, resident_info in self._resident_tabs.items()
+                if resident_info
+                and resident_info.tab
+                and self._is_resident_slot_selection_blocked(slot_id, resident_info)
+            ]
+        if not blocked_candidates:
+            return None, None
+        return min(
+            blocked_candidates,
+            key=lambda item: (
+                item[1].health_score,
+                -self._resident_error_streaks.get(item[0], 0),
+                item[1].last_used_at,
+                item[0],
+            ),
+        )
+
     def _is_resident_slot_cooling_down(
         self,
         resident_info: Optional[ResidentTabInfo],
     ) -> bool:
         if resident_info is None:
             return False
+        now_value = time.time()
+        if resident_info.cooldown_until > now_value:
+            return True
         if self._resident_fingerprint_cooldown_seconds <= 0:
             return False
-        return (time.time() - resident_info.last_used_at) < self._resident_fingerprint_cooldown_seconds
+        return (now_value - resident_info.last_used_at) < self._resident_fingerprint_cooldown_seconds
+
+    def _prune_slot_activity(self, resident_info: Optional[ResidentTabInfo], now_value: Optional[float] = None):
+        if resident_info is None:
+            return
+        current_time = now_value or time.time()
+        cutoff = current_time - self._fingerprint_window_seconds
+        while resident_info.recent_token_timestamps and resident_info.recent_token_timestamps[0] < cutoff:
+            resident_info.recent_token_timestamps.popleft()
+        while resident_info.recent_upstream_success_timestamps and resident_info.recent_upstream_success_timestamps[0] < cutoff:
+            resident_info.recent_upstream_success_timestamps.popleft()
+        if resident_info.cooldown_until and resident_info.cooldown_until <= current_time:
+            resident_info.cooldown_until = 0.0
+
+    def _is_resident_slot_rate_limited(
+        self,
+        resident_info: Optional[ResidentTabInfo],
+        *,
+        now_value: Optional[float] = None,
+    ) -> bool:
+        if resident_info is None:
+            return False
+        current_time = now_value or time.time()
+        self._prune_slot_activity(resident_info, current_time)
+        if resident_info.cooldown_until > current_time:
+            return True
+        return len(resident_info.recent_token_timestamps) >= self._fingerprint_max_uses_per_window
+
+    def _mark_slot_token_issued(self, resident_info: Optional[ResidentTabInfo]):
+        if resident_info is None:
+            return
+        now_value = time.time()
+        self._prune_slot_activity(resident_info, now_value)
+        resident_info.last_used_at = now_value
+        resident_info.last_token_at = now_value
+        resident_info.recent_token_timestamps.append(now_value)
+        if len(resident_info.recent_token_timestamps) >= self._fingerprint_max_uses_per_window:
+            resident_info.cooldown_until = max(
+                resident_info.cooldown_until,
+                now_value + self._fingerprint_rate_limit_cooldown_seconds,
+            )
+
+    def _mark_slot_upstream_success(self, resident_info: Optional[ResidentTabInfo]):
+        if resident_info is None:
+            return
+        now_value = time.time()
+        self._prune_slot_activity(resident_info, now_value)
+        resident_info.upstream_success_count += 1
+        resident_info.last_upstream_success_at = now_value
+        resident_info.recent_upstream_success_timestamps.append(now_value)
+        resident_info.health_score = min(20, resident_info.health_score + 2)
+
+    def _mark_slot_upstream_error(self, resident_info: Optional[ResidentTabInfo]):
+        if resident_info is None:
+            return
+        now_value = time.time()
+        self._prune_slot_activity(resident_info, now_value)
+        resident_info.upstream_error_count += 1
+        resident_info.health_score = max(-20, resident_info.health_score - 3)
+        resident_info.cooldown_until = max(
+            resident_info.cooldown_until,
+            now_value + min(30.0, max(3.0, self._fingerprint_rate_limit_cooldown_seconds / 2)),
+        )
+
+    def _resident_slot_priority_locked(
+        self,
+        item: tuple[str, ResidentTabInfo],
+    ) -> tuple[int, int, float, float, str]:
+        slot_id, resident_info = item
+        now_value = time.time()
+        self._prune_slot_activity(resident_info, now_value)
+        return (
+            resident_info.health_score,
+            -len(resident_info.recent_token_timestamps),
+            resident_info.cooldown_until if resident_info.cooldown_until > now_value else 0.0,
+            resident_info.last_used_at,
+            slot_id,
+        )
 
     def _pick_resident_slot_round_robin_locked(
         self,
@@ -1389,42 +1693,97 @@ class BrowserCaptchaService:
         if not pool:
             return None, None
 
+        prioritized_pool = [
+            (item, self._resident_slot_priority_locked(item))
+            for item in pool
+        ]
         ordered_pool = sorted(
-            pool,
-            key=lambda item: (item[1].created_at, item[0]),
+            prioritized_pool,
+            key=lambda entry: (
+                -entry[1][0],
+                entry[1][1],
+                entry[1][2],
+                entry[1][3],
+                entry[0][0],
+            ),
         )
         start_index = 0
         if self._resident_last_selected_order_key is not None:
-            for index, (slot_id, resident_info) in enumerate(ordered_pool):
+            for index, (item, _priority) in enumerate(ordered_pool):
+                slot_id, resident_info = item
                 if (resident_info.created_at, slot_id) > self._resident_last_selected_order_key:
                     start_index = index
                     break
 
-        selected = ordered_pool[start_index]
+        selected = ordered_pool[start_index][0]
         self._resident_last_selected_order_key = (selected[1].created_at, selected[0])
         return selected
+
+    def _get_resident_pool_snapshot_locked(self) -> Dict[str, int]:
+        total = len(self._resident_tabs)
+        ready_idle = 0
+        ready_busy = 0
+        cooling = 0
+        rate_limited = 0
+        unhealthy = 0
+        cold_idle = 0
+        rotating = 0
+
+        for slot_id, resident_info in self._resident_tabs.items():
+            if resident_info is None or not resident_info.tab:
+                continue
+            if self._is_resident_slot_rotation_due(resident_info):
+                rotating += 1
+            if self._is_resident_slot_selection_blocked(slot_id, resident_info):
+                unhealthy += 1
+            if self._is_resident_slot_cooling_down(resident_info):
+                cooling += 1
+            if self._is_resident_slot_rate_limited(resident_info):
+                rate_limited += 1
+            if resident_info.recaptcha_ready and not resident_info.solve_lock.locked():
+                ready_idle += 1
+            elif resident_info.recaptcha_ready and resident_info.solve_lock.locked():
+                ready_busy += 1
+            elif not resident_info.solve_lock.locked():
+                cold_idle += 1
+
+        return {
+            "total": total,
+            "ready_idle": ready_idle,
+            "ready_busy": ready_busy,
+            "cooling": cooling,
+            "rate_limited": rate_limited,
+            "unhealthy": unhealthy,
+            "cold_idle": cold_idle,
+            "rotating": rotating,
+            "capacity_left": max(0, self._max_resident_tabs - total),
+        }
 
     def _resolve_resident_slot_for_project_locked(
         self,
         project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
     ) -> tuple[Optional[str], Optional[ResidentTabInfo]]:
         """优先走最近映射；没有映射时退化到共享池全局挑选。"""
         slot_id = self._resolve_affinity_slot_locked(project_id)
         if slot_id:
             resident_info = self._resident_tabs.get(slot_id)
             if resident_info and resident_info.tab:
-                return slot_id, resident_info
-        return self._select_resident_slot_locked(project_id)
+                if self._is_resident_slot_selection_blocked(slot_id, resident_info):
+                    return None, None
+                if not token_id or resident_info.token_id in (None, token_id):
+                    return slot_id, resident_info
+                return None, None
+        return self._select_resident_slot_locked(project_id, token_id=token_id)
 
     def _select_resident_slot_locked(
         self,
         project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
+        *,
+        allow_busy: bool = True,
     ) -> tuple[Optional[str], Optional[ResidentTabInfo]]:
-        candidates = [
-            (slot_id, resident_info)
-            for slot_id, resident_info in self._resident_tabs.items()
-            if resident_info and resident_info.tab
-        ]
+        candidates = self._get_token_scoped_candidates_locked(token_id)
         if not candidates:
             return None, None
 
@@ -1433,14 +1792,19 @@ class BrowserCaptchaService:
         fresh_candidates = [
             (slot_id, resident_info)
             for slot_id, resident_info in candidates
-            if not self._is_resident_slot_rotation_due(resident_info)
+            if not self._is_resident_slot_selection_blocked(slot_id, resident_info)
+        ]
+        rate_limited_free_candidates = [
+            (slot_id, resident_info)
+            for slot_id, resident_info in fresh_candidates
+            if not self._is_resident_slot_rate_limited(resident_info)
         ]
         cooldown_free_candidates = [
             (slot_id, resident_info)
-            for slot_id, resident_info in fresh_candidates
+            for slot_id, resident_info in rate_limited_free_candidates
             if not self._is_resident_slot_cooling_down(resident_info)
         ]
-        effective_candidates = cooldown_free_candidates or fresh_candidates or candidates
+        effective_candidates = cooldown_free_candidates or rate_limited_free_candidates or fresh_candidates
 
         ready_idle = [
             (slot_id, resident_info)
@@ -1457,13 +1821,28 @@ class BrowserCaptchaService:
             for slot_id, resident_info in effective_candidates
             if not resident_info.recaptcha_ready and not resident_info.solve_lock.locked()
         ]
+        ready_busy = [
+            (slot_id, resident_info)
+            for slot_id, resident_info in effective_candidates
+            if resident_info.recaptcha_ready and resident_info.solve_lock.locked()
+        ]
+        cold_busy = [
+            (slot_id, resident_info)
+            for slot_id, resident_info in effective_candidates
+            if not resident_info.recaptcha_ready and resident_info.solve_lock.locked()
+        ]
 
-        pool = ready_idle or ready_busy or cold_idle or effective_candidates
+        pool = ready_idle or cold_idle
+        if not pool and allow_busy:
+            pool = ready_busy or cold_busy
+        if not pool:
+            return None, None
         return self._pick_resident_slot_round_robin_locked(pool)
 
     async def _ensure_resident_tab(
         self,
         project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
         *,
         force_create: bool = False,
         return_slot_key: bool = False,
@@ -1480,44 +1859,136 @@ class BrowserCaptchaService:
                 return slot_id, resident_info
             return resident_info
 
+        rebuild_slot_id: Optional[str] = None
+        rebuild_token_id: Optional[int] = None
+
         async with self._resident_lock:
-            slot_id, resident_info = self._select_resident_slot_locked(project_id)
-            if self._resident_tabs:
-                all_busy = all(info.solve_lock.locked() for info in self._resident_tabs.values())
+            token_candidates = self._get_token_scoped_candidates_locked(token_id)
+            healthy_candidates = [
+                (candidate_slot_id, info)
+                for candidate_slot_id, info in token_candidates
+                if not self._is_resident_slot_selection_blocked(candidate_slot_id, info)
+            ]
+            slot_id, resident_info = self._select_resident_slot_locked(project_id, token_id=token_id, allow_busy=False)
+            if healthy_candidates:
+                all_busy = all(info.solve_lock.locked() for _, info in healthy_candidates)
             else:
                 all_busy = True
 
-            should_create = force_create or not resident_info or (all_busy and len(self._resident_tabs) < self._max_resident_tabs)
+            can_runtime_create = self._can_create_runtime_resident_tab()
+            should_create = force_create or (
+                can_runtime_create and (not resident_info or (all_busy and len(self._resident_tabs) < self._max_resident_tabs))
+            )
             if not should_create:
-                return wrap(slot_id, resident_info)
+                if resident_info is None and len(self._resident_tabs) >= self._max_resident_tabs:
+                    rebuild_slot_id, rebuild_info = self._pick_forced_rebuild_candidate_locked(token_id)
+                    if rebuild_slot_id and rebuild_info:
+                        rebuild_token_id = rebuild_info.token_id or token_id
+                    else:
+                        return wrap(slot_id, resident_info)
+                else:
+                    self._assign_slot_to_token_locked(resident_info, token_id)
+                    return wrap(slot_id, resident_info)
+
+            if rebuild_slot_id:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] pool={self._pool_key}, project_id={project_id}, slot={rebuild_slot_id} "
+                    "pool saturated with unhealthy tabs, forcing in-place rebuild while keeping affinity"
+                )
+                rebuilt_slot_id, rebuilt_info = await self._rebuild_resident_tab(
+                    project_id,
+                    token_id=rebuild_token_id,
+                    slot_id=rebuild_slot_id,
+                    return_slot_key=True,
+                )
+                if rebuilt_info is not None:
+                    return wrap(rebuilt_slot_id, rebuilt_info)
+                return wrap(None, None)
 
             if len(self._resident_tabs) >= self._max_resident_tabs:
-                return wrap(slot_id, resident_info)
+                rebuild_slot_id, rebuild_info = self._pick_forced_rebuild_candidate_locked(token_id)
+                if rebuild_slot_id and rebuild_info:
+                    rebuild_token_id = rebuild_info.token_id or token_id
+                else:
+                    return wrap(slot_id, resident_info)
 
-        async with self._tab_build_lock:
+        if rebuild_slot_id:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] pool={self._pool_key}, project_id={project_id}, slot={rebuild_slot_id} "
+                "pool saturated with unhealthy tabs, forcing in-place rebuild while keeping affinity"
+            )
+            rebuilt_slot_id, rebuilt_info = await self._rebuild_resident_tab(
+                project_id,
+                token_id=rebuild_token_id,
+                slot_id=rebuild_slot_id,
+                return_slot_key=True,
+            )
+            if rebuilt_info is not None:
+                return wrap(rebuilt_slot_id, rebuilt_info)
+            return wrap(None, None)
+
+        async with self._tab_build_semaphore:
             async with self._resident_lock:
-                slot_id, resident_info = self._select_resident_slot_locked(project_id)
-                if self._resident_tabs:
-                    all_busy = all(info.solve_lock.locked() for info in self._resident_tabs.values())
+                token_candidates = self._get_token_scoped_candidates_locked(token_id)
+                healthy_candidates = [
+                    (candidate_slot_id, info)
+                    for candidate_slot_id, info in token_candidates
+                    if not self._is_resident_slot_selection_blocked(candidate_slot_id, info)
+                ]
+                slot_id, resident_info = self._select_resident_slot_locked(project_id, token_id=token_id, allow_busy=False)
+                if healthy_candidates:
+                    all_busy = all(info.solve_lock.locked() for _, info in healthy_candidates)
                 else:
                     all_busy = True
 
-                should_create = force_create or not resident_info or (all_busy and len(self._resident_tabs) < self._max_resident_tabs)
+                can_runtime_create = self._can_create_runtime_resident_tab()
+                should_create = force_create or (
+                    can_runtime_create and (not resident_info or (all_busy and len(self._resident_tabs) < self._max_resident_tabs))
+                )
                 if not should_create:
-                    return wrap(slot_id, resident_info)
+                    if resident_info is None and len(self._resident_tabs) >= self._max_resident_tabs:
+                        rebuild_slot_id, rebuild_info = self._pick_forced_rebuild_candidate_locked(token_id)
+                        if rebuild_slot_id and rebuild_info:
+                            rebuild_token_id = rebuild_info.token_id or token_id
+                        else:
+                            return wrap(slot_id, resident_info)
+                    else:
+                        self._assign_slot_to_token_locked(resident_info, token_id)
+                        return wrap(slot_id, resident_info)
 
                 if len(self._resident_tabs) >= self._max_resident_tabs:
-                    return wrap(slot_id, resident_info)
+                    rebuild_slot_id, rebuild_info = self._pick_forced_rebuild_candidate_locked(token_id)
+                    if rebuild_slot_id and rebuild_info:
+                        rebuild_token_id = rebuild_info.token_id or token_id
+                    else:
+                        return wrap(slot_id, resident_info)
 
                 new_slot_id = self._next_resident_slot_id()
 
-            resident_info = await self._create_resident_tab(new_slot_id, project_id=project_id)
+            if rebuild_slot_id:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] pool={self._pool_key}, project_id={project_id}, slot={rebuild_slot_id} "
+                    "pool saturated with unhealthy tabs, forcing in-place rebuild while keeping affinity"
+                )
+                rebuilt_slot_id, rebuilt_info = await self._rebuild_resident_tab(
+                    project_id,
+                    token_id=rebuild_token_id,
+                    slot_id=rebuild_slot_id,
+                    return_slot_key=True,
+                )
+                if rebuilt_info is not None:
+                    return wrap(rebuilt_slot_id, rebuilt_info)
+                return wrap(None, None)
+
+            resident_info = await self._create_resident_tab(new_slot_id, project_id=project_id, token_id=token_id)
             if resident_info is None:
                 async with self._resident_lock:
-                    slot_id, fallback_info = self._select_resident_slot_locked(project_id)
+                    slot_id, fallback_info = self._select_resident_slot_locked(project_id, token_id=token_id)
+                    self._assign_slot_to_token_locked(fallback_info, token_id)
                 return wrap(slot_id, fallback_info)
 
             async with self._resident_lock:
+                self._assign_slot_to_token_locked(resident_info, token_id)
                 self._resident_tabs[new_slot_id] = resident_info
                 self._sync_compat_resident_state()
                 return wrap(new_slot_id, resident_info)
@@ -1525,6 +1996,7 @@ class BrowserCaptchaService:
     async def _rebuild_resident_tab(
         self,
         project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
         *,
         slot_id: Optional[str] = None,
         return_slot_key: bool = False,
@@ -1535,11 +2007,11 @@ class BrowserCaptchaService:
                 return actual_slot_id, resident_info
             return resident_info
 
-        async with self._tab_build_lock:
+        async with self._tab_build_semaphore:
             async with self._resident_lock:
                 actual_slot_id = slot_id
                 if actual_slot_id is None:
-                    actual_slot_id, _ = self._resolve_resident_slot_for_project_locked(project_id)
+                    actual_slot_id, _ = self._resolve_resident_slot_for_project_locked(project_id, token_id=token_id)
 
                 old_resident = self._resident_tabs.pop(actual_slot_id, None) if actual_slot_id else None
                 self._forget_project_affinity_for_slot_locked(actual_slot_id)
@@ -1555,7 +2027,12 @@ class BrowserCaptchaService:
                     await self._close_tab_quietly(old_resident.tab)
 
             actual_slot_id = actual_slot_id or self._next_resident_slot_id()
-            resident_info = await self._create_resident_tab(actual_slot_id, project_id=project_id)
+            effective_token_id = token_id or (old_resident.token_id if old_resident else None)
+            resident_info = await self._create_resident_tab(
+                actual_slot_id,
+                project_id=project_id,
+                token_id=effective_token_id,
+            )
             if resident_info is None:
                 debug_logger.log_warning(
                     f"[BrowserCaptcha] slot={actual_slot_id}, project_id={project_id} 重建共享标签页失败"
@@ -1563,10 +2040,99 @@ class BrowserCaptchaService:
                 return wrap(actual_slot_id, None)
 
             async with self._resident_lock:
+                self._assign_slot_to_token_locked(resident_info, effective_token_id)
                 self._resident_tabs[actual_slot_id] = resident_info
                 self._remember_project_affinity(project_id, actual_slot_id, resident_info)
                 self._sync_compat_resident_state()
                 return wrap(actual_slot_id, resident_info)
+
+    async def _acquire_resident_slot_for_solve(
+        self,
+        project_id: Optional[str],
+        token_id: Optional[int] = None,
+    ) -> tuple[Optional[str], Optional[ResidentTabInfo]]:
+        deadline = time.time() + self._slot_wait_timeout_seconds
+        last_busy_slot_id: Optional[str] = None
+
+        while time.time() < deadline:
+            slot_id, resident_info = await self._ensure_resident_tab(project_id, token_id=token_id, return_slot_key=True)
+            if resident_info is None or not slot_id:
+                return None, None
+
+            if resident_info.recaptcha_ready and not resident_info.solve_lock.locked():
+                try:
+                    await asyncio.wait_for(resident_info.solve_lock.acquire(), timeout=0.2)
+                    self._assign_slot_to_token_locked(resident_info, token_id)
+                    return slot_id, resident_info
+                except asyncio.TimeoutError:
+                    last_busy_slot_id = slot_id
+            else:
+                last_busy_slot_id = slot_id
+
+            async with self._resident_lock:
+                pool_snapshot = self._get_resident_pool_snapshot_locked()
+                can_expand = len(self._resident_tabs) < self._max_resident_tabs
+
+            if can_expand and self._resident_runtime_expand_enabled:
+                await self._ensure_resident_tab(project_id, token_id=token_id, force_create=True, return_slot_key=True)
+
+            await asyncio.sleep(random.uniform(0.15, 0.35))
+
+        async with self._resident_lock:
+            fallback_slot_id, fallback_resident_info = self._select_resident_slot_locked(
+                project_id,
+                token_id=token_id,
+                allow_busy=True,
+            )
+            self._assign_slot_to_token_locked(fallback_resident_info, token_id)
+            pool_snapshot = self._get_resident_pool_snapshot_locked()
+
+        if fallback_resident_info is None or not fallback_slot_id:
+            return None, None
+
+        debug_logger.log_warning(
+            "[BrowserCaptcha] resident slot queue timeout, waiting for busy slot: "
+            f"project={project_id}, preferred_slot={last_busy_slot_id}, selected_slot={fallback_slot_id}, "
+            f"pool={pool_snapshot}, wait_timeout={self._slot_wait_timeout_seconds:.1f}s"
+        )
+        await asyncio.wait_for(
+            fallback_resident_info.solve_lock.acquire(),
+            timeout=max(1.0, min(3.0, self._slot_wait_timeout_seconds / 2)),
+        )
+        return fallback_slot_id, fallback_resident_info
+
+    async def _enter_queue_gate(self):
+        await asyncio.wait_for(
+            self._queue_semaphore.acquire(),
+            timeout=self._queue_acquire_timeout_seconds,
+        )
+
+    def _leave_queue_gate(self):
+        try:
+            self._queue_semaphore.release()
+        except Exception:
+            pass
+
+    def _schedule_standby_fill(self):
+        if self._standby_target_count <= 0:
+            return
+        if self._standby_fill_task and not self._standby_fill_task.done():
+            return
+        self._standby_fill_task = asyncio.create_task(self._ensure_standby_capacity())
+
+    async def _ensure_standby_capacity(self):
+        try:
+            await self.initialize()
+            for _ in range(self._standby_target_count + 1):
+                async with self._resident_lock:
+                    snapshot = self._get_resident_pool_snapshot_locked()
+                    ready_spares = max(0, snapshot["ready_idle"] - 1)
+                    can_expand = len(self._resident_tabs) < self._max_resident_tabs
+                if ready_spares >= self._standby_target_count or not can_expand:
+                    return
+                await self._ensure_resident_tab(None, force_create=True, return_slot_key=True)
+        except Exception as e:
+            debug_logger.log_warning(f"[BrowserCaptcha] standby fill failed: {e}")
 
     def _sync_compat_resident_state(self):
         """同步旧版单 resident 兼容属性。"""
@@ -1615,6 +2181,7 @@ class BrowserCaptchaService:
         browser_instance = self.browser
         self.browser = None
         self._initialized = False
+        self._browser_ready_event.clear()
         self._last_fingerprint = None
         self._tab_fingerprint_profiles.clear()
         self._cleanup_proxy_extension()
@@ -1623,10 +2190,14 @@ class BrowserCaptchaService:
 
         async with self._resident_lock:
             resident_items = list(self._resident_tabs.values())
+            stale_projects = list(self._project_resident_affinity.keys())
             self._resident_tabs.clear()
             self._project_resident_affinity.clear()
             self._resident_error_streaks.clear()
             self._sync_compat_resident_state()
+        for project_id in stale_projects:
+            if self.__class__._project_pool_keys.get(project_id) == self._pool_key:
+                self.__class__._project_pool_keys.pop(project_id, None)
 
         custom_items = list(self._custom_tabs.values())
         self._custom_tabs.clear()
@@ -1660,6 +2231,9 @@ class BrowserCaptchaService:
     async def _resolve_personal_proxy(self):
         """Read proxy config for personal captcha browser.
         Priority: captcha browser_proxy > request proxy."""
+        if self._proxy_url_override:
+            debug_logger.log_info(f"[BrowserCaptcha] Personal 使用池级固定代理: {self._proxy_url_override}")
+            return _parse_proxy_url(self._proxy_url_override)
         if not self.db:
             return None, None, None, None, None
         try:
@@ -1707,6 +2281,9 @@ class BrowserCaptchaService:
                         debug_logger.log_warning("[BrowserCaptcha] 浏览器已停止，准备重新初始化...")
                         browser_needs_restart = True
                     else:
+                        if not self._browser_ready_event.is_set():
+                            await self._probe_browser_ready_after_start(self.browser, timeout_seconds=5.0)
+                            self._browser_ready_event.set()
                         if self._idle_reaper_task is None or self._idle_reaper_task.done():
                             self._idle_reaper_task = asyncio.create_task(self._idle_tab_reaper_loop())
                         return
@@ -1720,6 +2297,7 @@ class BrowserCaptchaService:
                 await self._shutdown_browser_runtime_locked(reason="initialize_recovery")
 
             try:
+                self._browser_ready_event.clear()
                 self._fingerprint_profile = self._build_fingerprint_profile()
                 if self.user_data_dir:
                     debug_logger.log_info(f"[BrowserCaptcha] 正在启动 nodriver 浏览器 (用户数据目录: {self.user_data_dir})...")
@@ -1836,7 +2414,9 @@ class BrowserCaptchaService:
                     timeout_seconds=30.0,
                     label="nodriver.start",
                 )
+                await self._probe_browser_ready_after_start(self.browser, timeout_seconds=10.0)
                 self._initialized = True
+                self._browser_ready_event.set()
                 if self._idle_reaper_task is None or self._idle_reaper_task.done():
                     self._idle_reaper_task = asyncio.create_task(self._idle_tab_reaper_loop())
                 debug_logger.log_info(f"[BrowserCaptcha] ✅ nodriver 浏览器已启动 (Profile: {self.user_data_dir})")
@@ -1844,6 +2424,7 @@ class BrowserCaptchaService:
             except Exception as e:
                 self.browser = None
                 self._initialized = False
+                self._browser_ready_event.clear()
                 traceback_text = traceback.format_exc()
                 debug_logger.log_error(
                     "[BrowserCaptcha] nodriver.start traceback:\n"
@@ -1887,9 +2468,66 @@ class BrowserCaptchaService:
             if resident_info and resident_info.tab and slot_id:
                 if slot_id not in warmed_slots:
                     warmed_slots.append(slot_id)
+                self._remember_project_affinity(warm_project_id, slot_id, resident_info)
                 continue
             debug_logger.log_warning(f"[BrowserCaptcha] 预热共享标签页失败 (seed={warm_project_id})")
 
+        self._schedule_standby_fill()
+        return warmed_slots
+
+    async def warmup_resident_tabs_for_tokens(
+        self,
+        token_projects: Iterable[tuple[int, str]],
+        limit: Optional[int] = None,
+    ) -> list[str]:
+        """按 token 轮转预热常驻 tab，避免 tab 数被 token 数卡死。"""
+        normalized_targets: list[tuple[int, str]] = []
+        seen_targets = set()
+        for raw_token_id, raw_project_id in token_projects:
+            try:
+                token_id = int(raw_token_id)
+            except Exception:
+                continue
+            project_id = str(raw_project_id or "").strip()
+            if token_id <= 0 or not project_id:
+                continue
+            dedupe_key = (token_id, project_id)
+            if dedupe_key in seen_targets:
+                continue
+            seen_targets.add(dedupe_key)
+            normalized_targets.append((token_id, project_id))
+
+        if not normalized_targets:
+            return []
+
+        await self.initialize()
+
+        try:
+            warm_limit = self._max_resident_tabs if limit is None else max(1, min(self._max_resident_tabs, int(limit)))
+        except Exception:
+            warm_limit = self._max_resident_tabs
+
+        warmed_slots: list[str] = []
+        target_count = len(normalized_targets)
+        for index in range(warm_limit):
+            token_id, project_id = normalized_targets[index % target_count]
+            slot_id, resident_info = await self._ensure_resident_tab(
+                project_id,
+                token_id=token_id,
+                force_create=True,
+                return_slot_key=True,
+            )
+            if resident_info and resident_info.tab and slot_id:
+                self._assign_slot_to_token_locked(resident_info, token_id)
+                if slot_id not in warmed_slots:
+                    warmed_slots.append(slot_id)
+                self._remember_project_affinity(project_id, slot_id, resident_info)
+                continue
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] 预热 token 常驻标签页失败 (pool={self._pool_key}, token_id={token_id}, seed={project_id})"
+            )
+
+        self._schedule_standby_fill()
         return warmed_slots
 
     # ========== 常驻模式 API ==========
@@ -2149,23 +2787,128 @@ class BrowserCaptchaService:
         )
         return True
 
+    async def _restart_browser_pool(self, project_id: Optional[str] = None) -> bool:
+        async with self._resident_lock:
+            restore_slots = max(1, min(self._max_resident_tabs, len(self._resident_tabs) or 1))
+            restore_targets: list[tuple[int, str]] = []
+            seen_targets = set()
+            seed_candidates: list[str] = []
+
+            for resident_info in self._resident_tabs.values():
+                if resident_info is None:
+                    continue
+                token_id = int(resident_info.token_id or 0)
+                resident_project_id = str(resident_info.project_id or "").strip()
+                if token_id > 0 and resident_project_id:
+                    dedupe_key = (token_id, resident_project_id)
+                    if dedupe_key not in seen_targets:
+                        seen_targets.add(dedupe_key)
+                        restore_targets.append(dedupe_key)
+                elif resident_project_id:
+                    seed_candidates.append(resident_project_id)
+
+            if project_id:
+                normalized_project_id = str(project_id).strip()
+                if normalized_project_id:
+                    seed_candidates.insert(0, normalized_project_id)
+
+        self._pool_restart_cooldown_until = time.time() + self._pool_restart_cooldown_seconds
+        debug_logger.log_warning(
+            f"[BrowserCaptcha] pool={self._pool_key} unhealthy ratio exceeded threshold, restarting browser pool "
+            f"(restore_slots={restore_slots}, restore_targets={len(restore_targets)})"
+        )
+        await self._shutdown_browser_runtime(cancel_idle_reaper=False, reason=f"restart_pool:{self._pool_key}")
+
+        if restore_targets:
+            warmed_slots = await self.warmup_resident_tabs_for_tokens(restore_targets, limit=restore_slots)
+        else:
+            if not seed_candidates:
+                seed_candidates = [f"pool-restart-{index + 1}" for index in range(restore_slots)]
+            warmed_slots = await self.warmup_resident_tabs(seed_candidates, limit=restore_slots)
+
+        if not warmed_slots:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] pool={self._pool_key} browser pool restart finished without warmed slots"
+            )
+            return False
+
+        debug_logger.log_warning(
+            f"[BrowserCaptcha] pool={self._pool_key} browser pool restarted successfully "
+            f"(slots={len(warmed_slots)})"
+        )
+        return True
+
+    async def report_request_finished(self, project_id: Optional[str], success: bool = True):
+        """上游请求结束后回传结果，用于更新 slot 健康分。"""
+        normalized_project_id = str(project_id or "").strip()
+        if not normalized_project_id:
+            return
+        rebuild_slot_id: Optional[str] = None
+        rebuild_token_id: Optional[int] = None
+        restart_pool = False
+
+        async with self._resident_lock:
+            slot_id = self._resolve_affinity_slot_locked(normalized_project_id)
+            resident_info = self._resident_tabs.get(slot_id) if slot_id else None
+            if resident_info is None:
+                slot_id, resident_info = self._resolve_resident_slot_for_project_locked(normalized_project_id)
+            if resident_info is None or not slot_id:
+                return
+            if success:
+                self._mark_slot_upstream_success(resident_info)
+                self._resident_error_streaks.pop(slot_id, None)
+            else:
+                self._mark_slot_upstream_error(resident_info)
+                if self._should_rebuild_resident_slot(slot_id, resident_info):
+                    rebuild_slot_id = slot_id
+                    rebuild_token_id = resident_info.token_id
+            snapshot = self._get_resident_pool_snapshot_locked()
+            if not success and self._should_restart_pool_locked(snapshot):
+                restart_pool = True
+
+        debug_logger.log_info(
+            "[BrowserCaptcha] report_request_finished: "
+            f"pool={self._pool_key}, project_id={normalized_project_id}, slot={slot_id}, success={success}, "
+            f"health={resident_info.health_score}, upstream_success={resident_info.upstream_success_count}, "
+            f"upstream_error={resident_info.upstream_error_count}, pool={snapshot}"
+        )
+        if restart_pool:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] pool={self._pool_key}, project_id={normalized_project_id} "
+                f"unhealthy_ratio={snapshot.get('unhealthy', 0)}/{snapshot.get('total', 0)}, restarting browser pool"
+            )
+            await self._restart_browser_pool(normalized_project_id)
+            return
+        if rebuild_slot_id and not success:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] project_id={normalized_project_id}, slot={rebuild_slot_id} "
+                f"reached unhealthy threshold, rebuilding while keeping token/proxy-pool affinity"
+            )
+            await self._rebuild_resident_tab(
+                normalized_project_id,
+                token_id=rebuild_token_id,
+                slot_id=rebuild_slot_id,
+            )
+
     async def report_flow_error(self, project_id: str, error_reason: str, error_message: str = ""):
         """上游生成接口异常时，对常驻标签页执行自愈恢复。"""
         if not project_id:
             return
 
         async with self._resident_lock:
-            slot_id, _ = self._resolve_resident_slot_for_project_locked(project_id)
+            slot_id, resident_info = self._resolve_resident_slot_for_project_locked(project_id)
 
         if not slot_id:
             return
 
         streak = self._resident_error_streaks.get(slot_id, 0) + 1
         self._resident_error_streaks[slot_id] = streak
+        self._mark_slot_upstream_error(resident_info)
         error_text = f"{error_reason or ''} {error_message or ''}".strip()
         error_lower = error_text.lower()
         debug_logger.log_warning(
-            f"[BrowserCaptcha] project_id={project_id}, slot={slot_id} 收到上游异常，streak={streak}, reason={error_reason}, detail={error_message[:200]}"
+            f"[BrowserCaptcha] project_id={project_id}, slot={slot_id} 收到上游异常，streak={streak}, "
+            f"health={resident_info.health_score if resident_info else 'n/a'}, reason={error_reason}, detail={error_message[:200]}"
         )
 
         if not self._initialized or not self.browser:
@@ -2173,12 +2916,16 @@ class BrowserCaptchaService:
 
         # 403 错误：先清理缓存再重建
         if "403" in error_text or "forbidden" in error_lower or "recaptcha" in error_lower:
+            if streak < self._flow_recover_threshold:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] project_id={project_id}, slot={slot_id} 暂不恢复，等待更多同类错误 "
+                    f"(streak={streak}, threshold={self._flow_recover_threshold})"
+                )
+                return
             debug_logger.log_warning(
                 f"[BrowserCaptcha] project_id={project_id} 检测到 403/reCAPTCHA 错误，清理缓存并重建"
             )
-            healed = await self._clear_resident_storage_and_reload(project_id)
-            if not healed:
-                await self._recreate_resident_tab(project_id)
+            await self._recreate_resident_tab(project_id)
             return
 
         # 服务端错误：根据连续失败次数决定恢复策略
@@ -2299,7 +3046,13 @@ class BrowserCaptchaService:
         debug_logger.log_warning("[BrowserCaptcha] 自定义 reCAPTCHA 加载超时")
         return False
 
-    async def _execute_recaptcha_on_tab(self, tab, action: str = "IMAGE_GENERATION") -> Optional[str]:
+    async def _execute_recaptcha_on_tab(
+        self,
+        tab,
+        action: str = "IMAGE_GENERATION",
+        *,
+        allow_recaptcha_recover: bool = True,
+    ) -> Optional[str]:
         """在指定标签页执行 reCAPTCHA 获取 token
 
         Args:
@@ -2345,6 +3098,7 @@ class BrowserCaptchaService:
 
         # 轮询等待结果（最多 30 秒）
         token = None
+        last_error: Optional[str] = None
         for i in range(60):
             await tab.sleep(0.5)
             token = await self._tab_evaluate(
@@ -2362,6 +3116,7 @@ class BrowserCaptchaService:
                 timeout_seconds=2.0,
             )
             if error:
+                last_error = str(error)
                 debug_logger.log_error(f"[BrowserCaptcha] reCAPTCHA 错误: {error}")
                 break
 
@@ -2379,6 +3134,17 @@ class BrowserCaptchaService:
         if token:
             debug_logger.log_info(f"[BrowserCaptcha] ✅ Token 获取成功 (长度: {len(token)})")
         else:
+            if allow_recaptcha_recover and self._is_recaptcha_not_ready_error(last_error):
+                debug_logger.log_warning(
+                    "[BrowserCaptcha] reCAPTCHA runtime not ready on resident tab, retrying after reinject/wait"
+                )
+                ready = await self._wait_for_recaptcha(tab)
+                if ready:
+                    return await self._execute_recaptcha_on_tab(
+                        tab,
+                        action,
+                        allow_recaptcha_recover=False,
+                    )
             debug_logger.log_warning("[BrowserCaptcha] Token 获取失败，交由上层执行标签页恢复")
 
         return token
@@ -2907,7 +3673,12 @@ class BrowserCaptchaService:
 
     # ========== 主要 API ==========
 
-    async def get_token(self, project_id: str, action: str = "IMAGE_GENERATION") -> Optional[str]:
+    async def get_token(
+        self,
+        project_id: str,
+        action: str = "IMAGE_GENERATION",
+        token_id: Optional[int] = None,
+    ) -> Optional[str]:
         """获取 reCAPTCHA token
 
         使用全局共享打码标签页池。标签页不再按 project_id 一对一绑定，
@@ -2922,111 +3693,94 @@ class BrowserCaptchaService:
         Returns:
             reCAPTCHA token字符串，如果获取失败返回None
         """
-        debug_logger.log_info(f"[BrowserCaptcha] get_token 开始: project_id={project_id}, action={action}, 当前标签页数={len(self._resident_tabs)}/{self._max_resident_tabs}")
+        debug_logger.log_info(
+            f"[BrowserCaptcha] get_token 开始: pool={self._pool_key}, token_id={token_id}, "
+            f"project_id={project_id}, action={action}, 当前标签页数={len(self._resident_tabs)}/{self._max_resident_tabs}"
+        )
 
         # 确保浏览器已初始化
         await self.initialize()
         self._last_fingerprint = None
-
-        debug_logger.log_info(
-            f"[BrowserCaptcha] 开始从共享打码池获取标签页 (project: {project_id}, 当前: {len(self._resident_tabs)}/{self._max_resident_tabs})"
-        )
-        slot_id, resident_info = await self._ensure_resident_tab(project_id, return_slot_key=True)
-        if resident_info is None or not slot_id:
+        try:
+            await self._enter_queue_gate()
+        except asyncio.TimeoutError:
             debug_logger.log_warning(
-                f"[BrowserCaptcha] 共享标签页池不可用，fallback 到传统模式 (project: {project_id})"
+                f"[BrowserCaptcha] personal queue gate timeout, reject request: project={project_id}, "
+                f"queue_limit={self._queue_limit}, queue_timeout={self._queue_acquire_timeout_seconds:.1f}s"
             )
-            return await self._get_token_legacy(project_id, action)
+            return None
 
-        debug_logger.log_info(
-            f"[BrowserCaptcha] ✅ 共享标签页可用 (slot={slot_id}, project={project_id}, use_count={resident_info.use_count})"
-        )
-
-        if resident_info and resident_info.tab and self._is_resident_slot_rotation_due(resident_info):
+        try:
             debug_logger.log_info(
-                f"[BrowserCaptcha] 共享标签页达到指纹轮换阈值，准备重建 "
-                f"(slot={slot_id}, project={project_id}, use_count={resident_info.use_count}, "
-                f"max_use_count={self._resident_max_use_count})"
-            )
-            slot_id, resident_info = await self._rebuild_resident_tab(
-                project_id,
-                slot_id=slot_id,
-                return_slot_key=True,
-            )
-
-        if resident_info and resident_info.tab and not resident_info.recaptcha_ready:
-            debug_logger.log_warning(
-                f"[BrowserCaptcha] 共享标签页未就绪，准备重建 cold slot={slot_id}, project={project_id}"
-            )
-            slot_id, resident_info = await self._rebuild_resident_tab(
-                project_id,
-                slot_id=slot_id,
-                return_slot_key=True,
-            )
-
-        # 使用常驻标签页生成 token（在锁外执行，避免阻塞）
-        if resident_info and resident_info.recaptcha_ready and resident_info.tab:
-            start_time = time.time()
-            debug_logger.log_info(
-                f"[BrowserCaptcha] 从共享常驻标签页即时生成 token (slot={slot_id}, project={project_id}, action={action})..."
+                f"[BrowserCaptcha] 开始从共享打码池获取标签页 (project: {project_id}, 当前: {len(self._resident_tabs)}/{self._max_resident_tabs})"
             )
             try:
-                async with resident_info.solve_lock:
-                    token = await self._run_with_timeout(
-                        self._execute_recaptcha_on_tab(resident_info.tab, action),
-                        timeout_seconds=self._solve_timeout_seconds,
-                        label=f"resident_solve:{slot_id}:{project_id}:{action}",
-                    )
-                duration_ms = (time.time() - start_time) * 1000
-                if token:
-                    # 更新使用时间和计数
-                    resident_info.last_used_at = time.time()
-                    resident_info.use_count += 1
-                    self._remember_project_affinity(project_id, slot_id, resident_info)
-                    self._resident_error_streaks.pop(slot_id, None)
-                    self._last_fingerprint = await self._extract_tab_fingerprint(resident_info.tab)
-                    if isinstance(self._last_fingerprint, dict):
-                        debug_logger.log_info(
-                            "[BrowserCaptcha] token_success_fingerprint: "
-                            f"slot={slot_id}, "
-                            f"ua={str(self._last_fingerprint.get('user_agent') or '')[:160]}, "
-                            f"accept_language={str(self._last_fingerprint.get('accept_language') or '')}, "
-                            f"sec_ch_ua={str(self._last_fingerprint.get('sec_ch_ua') or '')[:220]}, "
-                            f"sec_ch_ua_platform={str(self._last_fingerprint.get('sec_ch_ua_platform') or '')}, "
-                            f"proxy={self._last_fingerprint.get('proxy_url')}"
-                        )
-                    debug_logger.log_info(
-                        f"[BrowserCaptcha] ✅ Token生成成功（slot={slot_id}, 耗时 {duration_ms:.0f}ms, 使用次数: {resident_info.use_count}）"
-                    )
-                    return token
-                else:
-                    debug_logger.log_warning(
-                        f"[BrowserCaptcha] 共享标签页生成失败 (slot={slot_id}, project={project_id})，尝试重建..."
-                    )
-            except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] 共享标签页异常 (slot={slot_id}): {e}，尝试重建...")
+                slot_id, resident_info = await self._acquire_resident_slot_for_solve(project_id, token_id=token_id)
+            except asyncio.TimeoutError:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] 获取共享标签页锁超时，回退 legacy 模式 (project: {project_id}, "
+                    f"wait_timeout={self._slot_wait_timeout_seconds:.1f}s)"
+                )
+                return await self._get_token_legacy(project_id, action)
+            if resident_info is None or not slot_id:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] 共享标签页池不可用，fallback 到传统模式 (project: {project_id})"
+                )
+                return await self._get_token_legacy(project_id, action)
 
-            # 常驻标签页失效，尝试重建
-            debug_logger.log_info(f"[BrowserCaptcha] 开始重建共享标签页 (slot={slot_id}, project={project_id})")
-            slot_id, resident_info = await self._rebuild_resident_tab(
-                project_id,
-                slot_id=slot_id,
-                return_slot_key=True,
+            debug_logger.log_info(
+                f"[BrowserCaptcha] ✅ 共享标签页可用 (slot={slot_id}, project={project_id}, use_count={resident_info.use_count}, "
+                f"health={resident_info.health_score}, recent_tokens={len(resident_info.recent_token_timestamps)})"
             )
-            debug_logger.log_info(f"[BrowserCaptcha] 共享标签页重建结束 (slot={slot_id}, project={project_id})")
 
-            # 重建后立即尝试生成（在锁外执行）
-            if resident_info:
+            if resident_info and resident_info.tab and self._is_resident_slot_rotation_due(resident_info):
+                if resident_info.solve_lock.locked():
+                    resident_info.solve_lock.release()
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] 共享标签页达到指纹轮换阈值，准备重建 "
+                    f"(slot={slot_id}, project={project_id}, use_count={resident_info.use_count}, "
+                    f"max_use_count={self._resident_max_use_count})"
+                )
+                slot_id, resident_info = await self._rebuild_resident_tab(
+                    project_id,
+                    token_id=token_id,
+                    slot_id=slot_id,
+                    return_slot_key=True,
+                )
+
+            if resident_info and resident_info.tab and not resident_info.recaptcha_ready:
+                if resident_info.solve_lock.locked():
+                    resident_info.solve_lock.release()
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] 共享标签页未就绪，准备重建 cold slot={slot_id}, project={project_id}"
+                )
+                slot_id, resident_info = await self._rebuild_resident_tab(
+                    project_id,
+                    token_id=token_id,
+                    slot_id=slot_id,
+                    return_slot_key=True,
+                )
+
+            # 使用常驻标签页生成 token（在锁外执行，避免阻塞）
+            if resident_info and resident_info.recaptcha_ready and resident_info.tab:
+                start_time = time.time()
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] 从共享常驻标签页即时生成 token (slot={slot_id}, project={project_id}, action={action})..."
+                )
                 try:
-                    async with resident_info.solve_lock:
+                    try:
                         token = await self._run_with_timeout(
                             self._execute_recaptcha_on_tab(resident_info.tab, action),
                             timeout_seconds=self._solve_timeout_seconds,
-                            label=f"resident_resolve_after_rebuild:{slot_id}:{project_id}:{action}",
+                            label=f"resident_solve:{slot_id}:{project_id}:{action}",
                         )
+                    finally:
+                        if resident_info.solve_lock.locked():
+                            resident_info.solve_lock.release()
+                    duration_ms = (time.time() - start_time) * 1000
                     if token:
-                        resident_info.last_used_at = time.time()
                         resident_info.use_count += 1
+                        self._mark_slot_token_issued(resident_info)
                         self._remember_project_affinity(project_id, slot_id, resident_info)
                         self._resident_error_streaks.pop(slot_id, None)
                         self._last_fingerprint = await self._extract_tab_fingerprint(resident_info.tab)
@@ -3040,20 +3794,83 @@ class BrowserCaptchaService:
                                 f"sec_ch_ua_platform={str(self._last_fingerprint.get('sec_ch_ua_platform') or '')}, "
                                 f"proxy={self._last_fingerprint.get('proxy_url')}"
                             )
-                        debug_logger.log_info(f"[BrowserCaptcha] ✅ 重建后 Token生成成功 (slot={slot_id})")
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] ✅ Token生成成功（slot={slot_id}, 耗时 {duration_ms:.0f}ms, 使用次数: {resident_info.use_count}, "
+                            f"recent_tokens={len(resident_info.recent_token_timestamps)}, health={resident_info.health_score}）"
+                        )
+                        self._schedule_standby_fill()
                         return token
-                except Exception:
-                    pass
+                    else:
+                        debug_logger.log_warning(
+                            f"[BrowserCaptcha] 共享标签页生成失败 (slot={slot_id}, project={project_id})，尝试重建..."
+                        )
+                except Exception as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] 共享标签页异常 (slot={slot_id}): {e}，尝试重建...")
 
-        # 最终 Fallback: 使用传统模式
-        debug_logger.log_warning(f"[BrowserCaptcha] 所有常驻方式失败，fallback 到传统模式 (project: {project_id})")
-        legacy_token = await self._get_token_legacy(project_id, action)
-        if legacy_token:
-            if slot_id:
-                self._resident_error_streaks.pop(slot_id, None)
-        return legacy_token
+                # 常驻标签页失效，尝试重建
+                debug_logger.log_info(f"[BrowserCaptcha] 开始重建共享标签页 (slot={slot_id}, project={project_id})")
+                slot_id, resident_info = await self._rebuild_resident_tab(
+                    project_id,
+                    token_id=token_id,
+                    slot_id=slot_id,
+                    return_slot_key=True,
+                )
+                debug_logger.log_info(f"[BrowserCaptcha] 共享标签页重建结束 (slot={slot_id}, project={project_id})")
 
-    async def _create_resident_tab(self, slot_id: str, project_id: Optional[str] = None) -> Optional[ResidentTabInfo]:
+                # 重建后立即尝试生成（在锁外执行）
+                if resident_info:
+                    try:
+                        await asyncio.wait_for(
+                            resident_info.solve_lock.acquire(),
+                            timeout=max(1.0, min(3.0, self._slot_wait_timeout_seconds / 2)),
+                        )
+                        try:
+                            token = await self._run_with_timeout(
+                                self._execute_recaptcha_on_tab(resident_info.tab, action),
+                                timeout_seconds=self._solve_timeout_seconds,
+                                label=f"resident_resolve_after_rebuild:{slot_id}:{project_id}:{action}",
+                            )
+                        finally:
+                            if resident_info.solve_lock.locked():
+                                resident_info.solve_lock.release()
+                        if token:
+                            resident_info.use_count += 1
+                            self._mark_slot_token_issued(resident_info)
+                            self._remember_project_affinity(project_id, slot_id, resident_info)
+                            self._resident_error_streaks.pop(slot_id, None)
+                            self._last_fingerprint = await self._extract_tab_fingerprint(resident_info.tab)
+                            if isinstance(self._last_fingerprint, dict):
+                                debug_logger.log_info(
+                                    "[BrowserCaptcha] token_success_fingerprint: "
+                                    f"slot={slot_id}, "
+                                    f"ua={str(self._last_fingerprint.get('user_agent') or '')[:160]}, "
+                                    f"accept_language={str(self._last_fingerprint.get('accept_language') or '')}, "
+                                    f"sec_ch_ua={str(self._last_fingerprint.get('sec_ch_ua') or '')[:220]}, "
+                                    f"sec_ch_ua_platform={str(self._last_fingerprint.get('sec_ch_ua_platform') or '')}, "
+                                    f"proxy={self._last_fingerprint.get('proxy_url')}"
+                                )
+                            debug_logger.log_info(f"[BrowserCaptcha] ✅ 重建后 Token生成成功 (slot={slot_id})")
+                            self._schedule_standby_fill()
+                            return token
+                    except Exception:
+                        pass
+
+            # 最终 Fallback: 使用传统模式
+            debug_logger.log_warning(f"[BrowserCaptcha] 所有常驻方式失败，fallback 到传统模式 (project: {project_id})")
+            legacy_token = await self._get_token_legacy(project_id, action)
+            if legacy_token:
+                if slot_id:
+                    self._resident_error_streaks.pop(slot_id, None)
+            return legacy_token
+        finally:
+            self._leave_queue_gate()
+
+    async def _create_resident_tab(
+        self,
+        slot_id: str,
+        project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
+    ) -> Optional[ResidentTabInfo]:
         """创建一个共享常驻打码标签页
 
         Args:
@@ -3065,8 +3882,11 @@ class BrowserCaptchaService:
         """
         try:
             # 使用 Flow API 地址作为基础页面
+            await self._await_browser_ready(timeout_seconds=15.0)
             website_url = "https://labs.google/fx/api/auth/providers"
-            debug_logger.log_info(f"[BrowserCaptcha] 创建共享常驻标签页 slot={slot_id}, seed_project={project_id}")
+            debug_logger.log_info(
+                f"[BrowserCaptcha] 创建共享常驻标签页 slot={slot_id}, seed_project={project_id}, token_id={token_id}"
+            )
 
             async with self._resident_lock:
                 existing_tabs = [info.tab for info in self._resident_tabs.values() if info.tab]
@@ -3117,7 +3937,9 @@ class BrowserCaptchaService:
                     await asyncio.sleep(0.3)  # 减少重试间隔
 
             if not page_loaded:
-                debug_logger.log_error(f"[BrowserCaptcha] 页面加载超时 (slot={slot_id}, project={project_id})")
+                debug_logger.log_error(
+                    f"[BrowserCaptcha] 页面加载超时 (slot={slot_id}, project={project_id}, token_id={token_id})"
+                )
                 await self._close_tab_quietly(tab)
                 return None
 
@@ -3130,19 +3952,25 @@ class BrowserCaptchaService:
             recaptcha_ready = await self._wait_for_recaptcha(tab)
 
             if not recaptcha_ready:
-                debug_logger.log_error(f"[BrowserCaptcha] reCAPTCHA 加载失败 (slot={slot_id}, project={project_id})")
+                debug_logger.log_error(
+                    f"[BrowserCaptcha] reCAPTCHA 加载失败 (slot={slot_id}, project={project_id}, token_id={token_id})"
+                )
                 await self._close_tab_quietly(tab)
                 return None
 
             # 创建常驻信息对象
-            resident_info = ResidentTabInfo(tab, slot_id, project_id=project_id)
+            resident_info = ResidentTabInfo(tab, slot_id, project_id=project_id, token_id=token_id)
             resident_info.recaptcha_ready = True
 
-            debug_logger.log_info(f"[BrowserCaptcha] ✅ 共享常驻标签页创建成功 (slot={slot_id}, project={project_id})")
+            debug_logger.log_info(
+                f"[BrowserCaptcha] ✅ 共享常驻标签页创建成功 (slot={slot_id}, project={project_id}, token_id={token_id})"
+            )
             return resident_info
 
         except Exception as e:
-            debug_logger.log_error(f"[BrowserCaptcha] 创建共享常驻标签页异常 (slot={slot_id}, project={project_id}): {e}")
+            debug_logger.log_error(
+                f"[BrowserCaptcha] 创建共享常驻标签页异常 (slot={slot_id}, project={project_id}, token_id={token_id}): {e}"
+            )
             return None
 
     async def _close_resident_tab(self, slot_id: str):

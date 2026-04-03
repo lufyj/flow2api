@@ -23,6 +23,7 @@ class LoadBalancer:
         self._image_pending: Dict[int, int] = {}
         self._video_pending: Dict[int, int] = {}
         self._pending_lock = asyncio.Lock()
+        self._selection_lock = asyncio.Lock()
         self._round_robin_state: Dict[str, Optional[int]] = {"image": None, "video": None, "default": None}
         self._rr_lock = asyncio.Lock()
 
@@ -117,7 +118,36 @@ class LoadBalancer:
             self._round_robin_state[scenario] = selected["token"].id
         return selected
 
+    @staticmethod
+    def _candidate_sort_key(item: dict) -> tuple:
+        return (
+            1 if item["needs_refresh"] else 0,
+            item["inflight"],
+            0 if item["remaining"] is None else 1,
+            -(item["remaining"] or 0),
+            item["token"].id or 0,
+        )
+
     async def select_token(
+        self,
+        for_image_generation: bool = False,
+        for_video_generation: bool = False,
+        model: Optional[str] = None,
+        reserve: bool = False,
+        enforce_concurrency_filter: bool = True,
+        track_pending: bool = False,
+    ) -> Optional[Token]:
+        async with self._selection_lock:
+            return await self._select_token_impl(
+                for_image_generation=for_image_generation,
+                for_video_generation=for_video_generation,
+                model=model,
+                reserve=reserve,
+                enforce_concurrency_filter=enforce_concurrency_filter,
+                track_pending=track_pending,
+            )
+
+    async def _select_token_impl(
         self,
         for_image_generation: bool = False,
         for_video_generation: bool = False,
@@ -215,8 +245,31 @@ class LoadBalancer:
             return None
 
         # 最低 in-flight 优先；有并发上限时，剩余槽位更多的 token 优先；最后随机打散
+        if track_pending and available_tokens:
+            min_inflight = min(item["inflight"] for item in available_tokens)
+            load_focused_candidates = [
+                item for item in available_tokens
+                if item["inflight"] == min_inflight
+            ]
+            if len(load_focused_candidates) != len(available_tokens):
+                debug_logger.log_info(
+                    f"[LOAD_BALANCER] track_pending strict-load mode: "
+                    f"narrowing candidates from {len(available_tokens)} to {len(load_focused_candidates)} "
+                    f"(min_inflight={min_inflight})"
+                )
+            available_tokens = load_focused_candidates
+
         call_mode = config.call_logic_mode
         if call_mode == "polling":
+            available_tokens.sort(
+                key=lambda item: (
+                    1 if item["needs_refresh"] else 0,
+                    item["inflight"],
+                    0 if item["remaining"] is None else 1,
+                    -(item["remaining"] or 0),
+                    item["random"]
+                )
+            )
             scenario = "default"
             if for_image_generation:
                 scenario = "image"
@@ -224,11 +277,16 @@ class LoadBalancer:
                 scenario = "video"
 
             ordered_candidates = []
-            first_candidate = await self._select_round_robin(available_tokens, scenario)
+            best_key = self._candidate_sort_key(available_tokens[0])
+            tied_candidates = [
+                item for item in available_tokens
+                if self._candidate_sort_key(item) == best_key
+            ]
+            first_candidate = await self._select_round_robin(tied_candidates, scenario)
             if first_candidate is not None:
                 ordered_candidates.append(first_candidate)
                 ordered_candidates.extend(
-                    item for item in sorted(available_tokens, key=lambda item: item["token"].id or 0)
+                    item for item in available_tokens
                     if item["token"].id != first_candidate["token"].id
                 )
             available_tokens = ordered_candidates

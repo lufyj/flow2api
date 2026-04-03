@@ -1,7 +1,7 @@
 """Data models for Flow2API"""
 
 from pydantic import BaseModel, ConfigDict
-from typing import Optional, List, Union, Any, Literal
+from typing import Optional, List, Union, Any, Literal, Dict
 from datetime import datetime
 
 
@@ -93,6 +93,30 @@ class Task(BaseModel):
     error_message: Optional[str] = None
     scene_id: Optional[str] = None  # Flow API的sceneId
     created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class GenerationJob(BaseModel):
+    """Durable queued generation job"""
+
+    id: Optional[int] = None
+    job_id: str
+    task_type: str  # generate_image
+    model: str
+    prompt: str
+    status: str  # queued, processing, completed, failed
+    progress: int = 0
+    input_assets: Optional[List[Dict[str, Any]]] = None
+    request_payload: Optional[Dict[str, Any]] = None
+    response_payload: Optional[Dict[str, Any]] = None
+    error_message: Optional[str] = None
+    token_id: Optional[int] = None
+    request_log_id: Optional[int] = None
+    worker_id: Optional[str] = None
+    retry_count: int = 0
+    max_retries: int = 0
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
 
