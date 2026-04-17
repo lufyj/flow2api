@@ -130,14 +130,6 @@ VIDEO_BASE_MODELS = {
         "landscape": "veo_3_1_t2v_fast_landscape",
         "portrait": "veo_3_1_t2v_fast_portrait",
     },
-    "veo_2_1_fast_d_15_t2v": {
-        "landscape": "veo_2_1_fast_d_15_t2v_landscape",
-        "portrait": "veo_2_1_fast_d_15_t2v_portrait",
-    },
-    "veo_2_0_t2v": {
-        "landscape": "veo_2_0_t2v_landscape",
-        "portrait": "veo_2_0_t2v_portrait",
-    },
     "veo_3_1_t2v_fast_ultra": {
         "landscape": "veo_3_1_t2v_fast_ultra",
         "portrait": "veo_3_1_t2v_fast_portrait_ultra",
@@ -158,14 +150,6 @@ VIDEO_BASE_MODELS = {
     "veo_3_1_i2v_s_fast_fl": {
         "landscape": "veo_3_1_i2v_s_fast_fl",
         "portrait": "veo_3_1_i2v_s_fast_portrait_fl",
-    },
-    "veo_2_1_fast_d_15_i2v": {
-        "landscape": "veo_2_1_fast_d_15_i2v_landscape",
-        "portrait": "veo_2_1_fast_d_15_i2v_portrait",
-    },
-    "veo_2_0_i2v": {
-        "landscape": "veo_2_0_i2v_landscape",
-        "portrait": "veo_2_0_i2v_portrait",
     },
     "veo_3_1_i2v_s_fast_ultra_fl": {
         "landscape": "veo_3_1_i2v_s_fast_ultra_fl",

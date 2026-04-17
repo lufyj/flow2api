@@ -244,38 +244,6 @@ MODEL_CONFIG = {
         "supports_images": False
     },
 
-    # veo_2_1_fast_d_15_t2v (需要新增横竖屏)
-    "veo_2_1_fast_d_15_t2v_portrait": {
-        "type": "video",
-        "video_type": "t2v",
-        "model_key": "veo_2_1_fast_d_15_t2v",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": False
-    },
-    "veo_2_1_fast_d_15_t2v_landscape": {
-        "type": "video",
-        "video_type": "t2v",
-        "model_key": "veo_2_1_fast_d_15_t2v",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": False
-    },
-
-    # veo_2_0_t2v (需要新增横竖屏)
-    "veo_2_0_t2v_portrait": {
-        "type": "video",
-        "video_type": "t2v",
-        "model_key": "veo_2_0_t2v",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": False
-    },
-    "veo_2_0_t2v_landscape": {
-        "type": "video",
-        "video_type": "t2v",
-        "model_key": "veo_2_0_t2v",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": False
-    },
-
     # veo_3_1_t2v_fast_ultra (横竖屏)
     "veo_3_1_t2v_fast_portrait_ultra": {
         "type": "video",
@@ -360,46 +328,6 @@ MODEL_CONFIG = {
         "type": "video",
         "video_type": "i2v",
         "model_key": "veo_3_1_i2v_s_fast_fl",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": True,
-        "min_images": 1,
-        "max_images": 2
-    },
-
-    # veo_2_1_fast_d_15_i2v (需要新增横竖屏)
-    "veo_2_1_fast_d_15_i2v_portrait": {
-        "type": "video",
-        "video_type": "i2v",
-        "model_key": "veo_2_1_fast_d_15_i2v",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": True,
-        "min_images": 1,
-        "max_images": 2
-    },
-    "veo_2_1_fast_d_15_i2v_landscape": {
-        "type": "video",
-        "video_type": "i2v",
-        "model_key": "veo_2_1_fast_d_15_i2v",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": True,
-        "min_images": 1,
-        "max_images": 2
-    },
-
-    # veo_2_0_i2v (需要新增横竖屏)
-    "veo_2_0_i2v_portrait": {
-        "type": "video",
-        "video_type": "i2v",
-        "model_key": "veo_2_0_i2v",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": True,
-        "min_images": 1,
-        "max_images": 2
-    },
-    "veo_2_0_i2v_landscape": {
-        "type": "video",
-        "video_type": "i2v",
-        "model_key": "veo_2_0_i2v",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
         "supports_images": True,
         "min_images": 1,

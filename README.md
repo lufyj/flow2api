@@ -174,10 +174,6 @@ python main.py
 |---------|---------|--------|
 | `veo_3_1_t2v_fast_portrait` | 文生视频 | 竖屏 |
 | `veo_3_1_t2v_fast_landscape` | 文生视频 | 横屏 |
-| `veo_2_1_fast_d_15_t2v_portrait` | 文生视频 | 竖屏 |
-| `veo_2_1_fast_d_15_t2v_landscape` | 文生视频 | 横屏 |
-| `veo_2_0_t2v_portrait` | 文生视频 | 竖屏 |
-| `veo_2_0_t2v_landscape` | 文生视频 | 横屏 |
 | `veo_3_1_t2v_fast_portrait_ultra` | 文生视频 | 竖屏 |
 | `veo_3_1_t2v_fast_ultra` | 文生视频 | 横屏 |
 | `veo_3_1_t2v_fast_portrait_ultra_relaxed` | 文生视频 | 竖屏 |
@@ -200,10 +196,6 @@ python main.py
 |---------|---------|--------|
 | `veo_3_1_i2v_s_fast_portrait_fl` | 图生视频 | 竖屏 |
 | `veo_3_1_i2v_s_fast_fl` | 图生视频 | 横屏 |
-| `veo_2_1_fast_d_15_i2v_portrait` | 图生视频 | 竖屏 |
-| `veo_2_1_fast_d_15_i2v_landscape` | 图生视频 | 横屏 |
-| `veo_2_0_i2v_portrait` | 图生视频 | 竖屏 |
-| `veo_2_0_i2v_landscape` | 图生视频 | 横屏 |
 | `veo_3_1_i2v_s_fast_portrait_ultra_fl` | 图生视频 | 竖屏 |
 | `veo_3_1_i2v_s_fast_ultra_fl` | 图生视频 | 横屏 |
 | `veo_3_1_i2v_s_fast_portrait_ultra_relaxed` | 图生视频 | 竖屏 |
